@@ -3,6 +3,9 @@ import re
 import random
 import hashlib
 import asyncio
+import html
+import json
+from urllib import request as urllib_request, error as urllib_error
 from datetime import datetime, date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,8 +20,13 @@ from aiogram.filters import Command
 from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery
 from supabase import create_client
 
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
-APP_VERSION = "2026-05-29-unlimited-expanded-descriptions-v8"
+
+APP_VERSION = "2026-05-29-situation-ai-openrouter-v10"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
@@ -27,6 +35,19 @@ CRON_SECRET = os.getenv("CRON_SECRET", WEBHOOK_SECRET)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openrouter").strip().lower()
+AI_SITUATION_INTERPRETATION_ENABLED = os.getenv("AI_SITUATION_INTERPRETATION_ENABLED", "1") == "1"
+
+# Основной вариант для регионов, где Gemini API недоступен.
+# Можно использовать free-router: OPENROUTER_MODEL=openrouter/free
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+
+# Оставлено как опциональный fallback: если захочешь снова включить Gemini, поставь AI_PROVIDER=gemini.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 DEFAULT_DAILY_POST_TIME = "08:00"
@@ -68,6 +89,12 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+try:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY) if genai and GEMINI_API_KEY else None
+except Exception as exc:
+    print(f"[GEMINI_INIT_ERROR] {exc}")
+    gemini_client = None
 
 
 CARD_IMAGES = {
@@ -1554,6 +1581,231 @@ async def send_three_cards_for_message(message: Message, user: dict):
         await message.answer("Этот расклад закреплён за тобой до конца текущего дня.")
 
 
+
+def strip_html_tags(value: str) -> str:
+    return re.sub(r"<[^>]+>", "", value or "")
+
+
+def looks_like_playful_question(question: str) -> bool:
+    text_value = (question or "").lower()
+    playful_markers = [
+        "ахах", "хаха", "лол", "рофл", "шут", "прикол", "мем", "угар",
+        "смеш", "кот", "котик", "пельмен", "шаверм", "шаурм", "дошик",
+        "властелин", "магия", "принц", "принцес", "дракон", "единорог",
+    ]
+    return any(marker in text_value for marker in playful_markers)
+
+
+def situation_cards_context_for_ai(question: str, positions: list[tuple[str, dict]]) -> str:
+    blocks = []
+
+    for position, card in positions:
+        standard_description = get_standard_card_description(card, context="situation", position=position)
+        blocks.append(
+            f"Позиция: {position}\n"
+            f"Карта: {strip_html_tags(card_title(card))}\n"
+            f"Краткое значение: {get_card_meaning(card)}\n"
+            f"Подробное описание карты из базы бота:\n{strip_html_tags(standard_description)}"
+        )
+
+    mode = "шуточный" if looks_like_playful_question(question) else "обычный"
+
+    return (
+        f"Режим вопроса: {mode}\n"
+        f"Вопрос пользователя: {question}\n\n"
+        "Выпавшие карты и значения:\n\n"
+        + "\n\n---\n\n".join(blocks)
+    )
+
+
+def build_ai_situation_prompt(question: str, positions: list[tuple[str, dict]]) -> str:
+    cards_context = situation_cards_context_for_ai(question, positions)
+
+    return f"""
+Ты — внимательный ИИ-интерпретатор карт Таро в развлекательном Telegram-боте.
+Пиши только на русском языке.
+
+Главная задача:
+- Получи вопрос пользователя, названия карт, их позиции и описания.
+- Если вопрос явно шуточный, ответь с лёгким юмором и подыграй, но всё равно мягко привяжи ответ к картам.
+- Если вопрос обычный, дай конструктивный разбор на основе выпавших карт.
+- Не обещай точное будущее и не утверждай, что карты гарантируют события.
+- Не давай медицинских, юридических, инвестиционных или финансовых инструкций.
+- Не запугивай пользователя.
+- Не пиши мистический фатализм вроде «это точно случится».
+- Не говори, что ты искусственный интеллект.
+- Не используй Markdown-разметку: не ставь ###, **жирный**, таблицы и code block.
+- Можно использовать простые заголовки текстом.
+
+Стиль:
+- живой, понятный, тёплый;
+- без канцелярита;
+- достаточно подробно, но без воды;
+- 1800–3000 знаков.
+
+Структура ответа:
+1. Общий смысл расклада
+2. Что показывает каждая карта
+3. Как карты связаны между собой
+4. Что можно сделать практически
+5. Итоговая мысль
+
+Контекст расклада:
+{cards_context}
+""".strip()
+
+
+def call_openrouter_sync(prompt: str) -> str | None:
+    if not OPENROUTER_API_KEY:
+        return None
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.75,
+        "max_tokens": 1400,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": "Tarot Telegram Bot",
+    }
+
+    if BASE_URL:
+        headers["HTTP-Referer"] = BASE_URL
+
+    request = urllib_request.Request(
+        OPENROUTER_BASE_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(request, timeout=45) as response:
+            raw = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        print(f"[OPENROUTER_HTTP_ERROR] status={exc.code} body={body[:1000]}")
+        return None
+    except Exception as exc:
+        print(f"[OPENROUTER_REQUEST_ERROR] {exc}")
+        return None
+
+    try:
+        data = json.loads(raw)
+        choices = data.get("choices") or []
+        if not choices:
+            print(f"[OPENROUTER_EMPTY_CHOICES] {raw[:1000]}")
+            return None
+
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text_parts.append(str(item.get("text") or item.get("content") or ""))
+                else:
+                    text_parts.append(str(item))
+            return "".join(text_parts).strip() or None
+
+        return str(content or "").strip() or None
+    except Exception as exc:
+        print(f"[OPENROUTER_PARSE_ERROR] {exc}; raw={raw[:1000]}")
+        return None
+
+
+def call_gemini_sync(prompt: str) -> str | None:
+    if not gemini_client:
+        return None
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        text_value = (getattr(response, "text", None) or "").strip()
+        return text_value or None
+    except Exception as exc:
+        print(f"[GEMINI_GENERATION_ERROR] {exc}")
+        return None
+
+
+async def generate_ai_situation_interpretation(question: str, positions: list[tuple[str, dict]]) -> str | None:
+    if not AI_SITUATION_INTERPRETATION_ENABLED:
+        return None
+
+    prompt = build_ai_situation_prompt(question, positions)
+
+    if AI_PROVIDER == "gemini":
+        return await asyncio.to_thread(call_gemini_sync, prompt)
+
+    # По умолчанию используем OpenRouter: он удобнее для регионов, где Gemini API недоступен.
+    return await asyncio.to_thread(call_openrouter_sync, prompt)
+
+
+def fallback_situation_interpretation(question: str, positions: list[tuple[str, dict]]) -> str:
+    playful = looks_like_playful_question(question)
+
+    if playful:
+        intro = (
+            "Похоже, вопрос задан с улыбкой, поэтому карты тоже не будут делать вид, "
+            "что собрались на заседание совета директоров. Но даже в шуточном вопросе можно поймать полезный намёк."
+        )
+    else:
+        intro = (
+            "Если смотреть на расклад конструктивно, карты не дают жёсткий прогноз, "
+            "а показывают три слоя ситуации: что лежит на поверхности, что может влиять скрыто и куда всё может повернуть при текущем подходе."
+        )
+
+    lines = [
+        "<b>ИИ-интерпретация временно недоступна, поэтому даю расширенный разбор по встроенной базе карт.</b>",
+        "",
+        f"<b>Вопрос:</b> {html.escape(question)}",
+        "",
+        intro,
+        "",
+        "<b>Разбор по картам:</b>",
+    ]
+
+    for position, card in positions:
+        lines.extend([
+            "",
+            f"<b>{position}: {card_title(card)}</b>",
+            html.escape(get_card_meaning(card)),
+            "",
+            html.escape(strip_html_tags(get_standard_card_description(card, context="situation", position=position))),
+        ])
+
+    lines.extend([
+        "",
+        "<b>Итог:</b>",
+        "Используй этот расклад как способ посмотреть на ситуацию под другим углом: где стоит действовать, где лучше не спешить, а где полезно честно признать свои ожидания.",
+    ])
+
+    return "\n".join(lines)
+
+
+async def answer_ai_situation_interpretation(message: Message, question: str, positions: list[tuple[str, dict]]):
+    await message.answer("Собираю подробную ИИ-интерпретацию расклада… 🧠")
+
+    ai_text = await generate_ai_situation_interpretation(question, positions)
+
+    if ai_text:
+        final_text = "<b>Подробная ИИ-интерпретация</b>\n\n" + html.escape(ai_text)
+    else:
+        final_text = fallback_situation_interpretation(question, positions)
+
+    await answer_long_text(message, final_text)
+
 async def send_situation_reading_for_message(message: Message, user: dict, question: str):
     question = question.strip()
 
@@ -1593,9 +1845,12 @@ async def send_situation_reading_for_message(message: Message, user: dict, quest
 Расклад на ситуацию:""")
 
     for position, card in positions:
-        caption = f"""{position}: {card_title(card)}
-{get_card_meaning(card)}"""
+        caption = f"""<b>{position}:</b> {card_title(card)}
+
+<b>Краткий смысл:</b> {get_card_meaning(card)}"""
         await answer_card(message, card, caption)
+
+    await answer_ai_situation_interpretation(message, question, positions)
 
     await message.answer(
         "Совет: воспринимай расклад как способ посмотреть на ситуацию под другим углом, а не как окончательное решение.",
@@ -2166,7 +2421,7 @@ async def help_button_handler(message: Message):
 
 🧬 Карты рождения — персональный набор из 5 карт по дате и времени рождения.
 
-✍️ Расклад на ситуацию — ты пишешь вопрос, бот выбирает карты и даёт трактовку. Стоимость: {SITUATION_READING_COST} токенов.
+✍️ Расклад на ситуацию — ты пишешь вопрос, бот выбирает карты и даёт ИИ-интерпретацию на основе выпавших карт. Стоимость: {SITUATION_READING_COST} токенов.
 
 📅 Сохранить дату рождения — нужно для персональных карт рождения.
 
@@ -2257,6 +2512,8 @@ async def root():
             "unlimited_tokens",
             "expanded_standard_descriptions",
             "telegram_stars_balance",
+            "ai_situation_interpretation",
+            "openrouter_ai_provider",
         ],
     }
 
