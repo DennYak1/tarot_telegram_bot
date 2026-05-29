@@ -261,6 +261,7 @@ def get_card_image_url(card: str) -> str | None:
         return None
 
     return f"{BASE_URL}/static/cards/{filename}"
+
 def make_seed(*parts: str) -> int:
     raw = "|".join(str(part) for part in parts)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -463,15 +464,29 @@ async def three_cards_handler(message: Message):
         cards = draw_cards(seed, 3)
         save_reading(user["id"], "three_cards", cards)
 
-    text = (
-        "Расклад на сегодня: **прошлое / настоящее / будущее**\n\n"
-        f"**Прошлое:** {cards[0]} — {CARD_MEANINGS.get(cards[0])}\n\n"
-        f"**Настоящее:** {cards[1]} — {CARD_MEANINGS.get(cards[1])}\n\n"
-        f"**Будущее:** {cards[2]} — {CARD_MEANINGS.get(cards[2])}\n\n"
-        "Этот расклад закреплён за тобой до конца текущего дня."
-    )
+    positions = [
+        ("Прошлое", cards[0]),
+        ("Настоящее", cards[1]),
+        ("Будущее", cards[2]),
+    ]
 
-    await message.answer(text)
+    await message.answer("Расклад на сегодня: прошлое / настоящее / будущее")
+
+    for position, card in positions:
+        meaning = CARD_MEANINGS.get(card, "Толкование пока не добавлено.")
+        image_url = get_card_image_url(card)
+
+        caption = (
+            f"{position}: {card}\n"
+            f"{meaning}"
+        )
+
+        if image_url:
+            await message.answer_photo(photo=image_url, caption=caption)
+        else:
+            await message.answer(caption)
+
+    await message.answer("Этот расклад закреплён за тобой до конца текущего дня.")
 
 
 @dp.message(Command("situation"))
