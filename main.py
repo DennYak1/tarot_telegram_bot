@@ -16,7 +16,6 @@ from supabase import create_client
 
 from fastapi.staticfiles import StaticFiles
 
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")  # например: https://your-bot.onrender.com
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tarot-secret")
@@ -222,7 +221,6 @@ TAROT_CARDS = [
     "Король Жезлов",
 ]
 
-
 CARD_MEANINGS = {
     "Шут": "новое начало, спонтанность, шаг в неизвестность",
     "Маг": "воля, действие, способность влиять на ситуацию",
@@ -354,8 +352,10 @@ MAIN_MENU = ReplyKeyboardMarkup(
 
 USER_WAITING_ACTION = {}
 
+
 def today_str() -> str:
     return datetime.now(TZ).date().isoformat()
+
 
 def get_card_image_url(card) -> str | None:
     name = card_name(card)
@@ -368,6 +368,7 @@ def get_card_image_url(card) -> str | None:
     public_base_url = BASE_URL or "https://tarot-telegram-bot-0hfs.onrender.com"
 
     return f"{public_base_url.rstrip('/')}/static/cards/{filename}"
+
 
 def make_seed(*parts: str) -> int:
     raw = "|".join(str(part) for part in parts)
@@ -389,6 +390,8 @@ def draw_cards(seed: int, count: int, allow_reversed: bool = True) -> list[dict]
         })
 
     return result
+
+
 def card_name(card) -> str:
     if isinstance(card, dict):
         return card.get("name", "")
@@ -423,6 +426,7 @@ def get_card_meaning(card) -> str:
         name,
         "толкование пока не добавлено"
     )
+
 
 def format_cards(cards: list) -> str:
     lines = []
@@ -508,6 +512,7 @@ async def start_handler(message: Message):
 
     await message.answer(text, reply_markup=MAIN_MENU)
 
+
 @dp.message(Command("birth"))
 async def birth_handler(message: Message):
     user = get_or_create_user(message)
@@ -520,7 +525,7 @@ async def birth_handler(message: Message):
         await message.answer(
             "Напиши дату и время рождения в формате:\n\n"
             "`/birth 2000-05-17 14:30`",
-            
+
         )
         return
 
@@ -548,7 +553,7 @@ async def birth_cards_handler(message: Message):
         await message.answer(
             "Сначала сохрани дату рождения:\n\n"
             "`/birth 2000-05-17 14:30`",
-            
+
         )
         return
 
@@ -596,6 +601,7 @@ async def daily_card_handler(message: Message):
     else:
         await message.answer(text)
 
+
 @dp.message(Command("three"))
 async def three_cards_handler(message: Message):
     user = get_or_create_user(message)
@@ -629,6 +635,7 @@ async def three_cards_handler(message: Message):
             await message.answer(caption)
 
     await message.answer("Этот расклад закреплён за тобой до конца текущего дня.")
+
 
 @dp.message(Command("situation"))
 async def situation_handler(message: Message):
@@ -677,6 +684,7 @@ async def situation_handler(message: Message):
         "Совет: воспринимай расклад как способ посмотреть на ситуацию под другим углом, а не как окончательное решение.",
         reply_markup=MAIN_MENU,
     )
+
 
 @dp.message(F.text == "🌞 Карта дня")
 async def daily_card_button_handler(message: Message):
@@ -727,6 +735,7 @@ async def help_button_handler(message: Message):
     )
 
     await message.answer(text, reply_markup=MAIN_MENU)
+
 
 @dp.message()
 async def plain_text_handler(message: Message):
@@ -779,6 +788,8 @@ async def plain_text_handler(message: Message):
         "Выбери действие на кнопках ниже.",
         reply_markup=MAIN_MENU
     )
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "tarot-bot"}
