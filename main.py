@@ -463,7 +463,7 @@ def get_or_create_user(message: Message):
     return created.data[0]
 
 
-def save_reading(user_id: int, reading_type: str, cards: list[str], question_text: str | None = None):
+def save_reading(user_id: int, reading_type: str, cards: list, question_text: str | None = None):
     payload = {
         "user_id": user_id,
         "reading_type": reading_type,
@@ -495,25 +495,18 @@ def get_daily_reading(user_id: int, reading_type: str):
 async def start_handler(message: Message):
     get_or_create_user(message)
 
-    text = (
-        "Привет. Я Tarot-бот 🔮\n\n"
-        "Выбери действие на кнопках ниже:\n\n"
-        "🌞 Карта дня — личная карта до конца дня\n"
-        "🔮 3 карты — прошлое / настоящее / будущее\n"
-        "🧬 Карты рождения — 5 карт по дате и времени рождения\n"
-        "✍️ Расклад на ситуацию — задай свой вопрос\n\n"
-        "Пока это развлекательный ботик. Не воспринимай расклады как финансовый, медицинский или юридический совет."
-    )
+    text = """Привет. Я Tarot-бот 🔮
+
+Выбери действие на кнопках ниже:
+
+🌞 Карта дня — личная карта до конца дня
+🔮 3 карты — прошлое / настоящее / будущее
+🧬 Карты рождения — 5 карт по дате и времени рождения
+✍️ Расклад на ситуацию — задай свой вопрос
+
+Пока это развлекательный ботик. Не воспринимай расклады как финансовый, медицинский или юридический совет."""
 
     await message.answer(text, reply_markup=MAIN_MENU)
-
-    image_url = get_card_image_url(card)
-
-    if image_url:
-        await message.answer_photo(photo=image_url, caption=text)
-    else:
-        await message.answer(text)
-
 
 @dp.message(Command("birth"))
 async def birth_handler(message: Message):
@@ -590,11 +583,11 @@ async def daily_card_handler(message: Message):
 
     card = cards[0]
 
-    text = (
-        f"Карта дня на сегодня: **{card}**\n\n"
-        f"Смысл карты: {CARD_MEANINGS.get(card)}.\n\n"
-        "Эта карта закреплена за тобой до конца текущего дня."
-    )
+    text = f"""Карта дня на сегодня: {card_title(card)}
+
+Смысл карты: {get_card_meaning(card)}.
+
+Эта карта закреплена за тобой до конца текущего дня."""
 
     image_url = get_card_image_url(card)
 
@@ -602,7 +595,6 @@ async def daily_card_handler(message: Message):
         await message.answer_photo(photo=image_url, caption=text)
     else:
         await message.answer(text)
-
 
 @dp.message(Command("three"))
 async def three_cards_handler(message: Message):
@@ -626,13 +618,10 @@ async def three_cards_handler(message: Message):
     await message.answer("Расклад на сегодня: прошлое / настоящее / будущее")
 
     for position, card in positions:
-        meaning = CARD_MEANINGS.get(card, "Толкование.........")
-        image_url = get_card_image_url(card)
+        caption = f"""{position}: {card_title(card)}
+{get_card_meaning(card)}"""
 
-        caption = (
-            f"{position}: {card}\n"
-            f"{meaning}"
-        )
+        image_url = get_card_image_url(card)
 
         if image_url:
             await message.answer_photo(photo=image_url, caption=caption)
@@ -641,7 +630,6 @@ async def three_cards_handler(message: Message):
 
     await message.answer("Этот расклад закреплён за тобой до конца текущего дня.")
 
-
 @dp.message(Command("situation"))
 async def situation_handler(message: Message):
     user = get_or_create_user(message)
@@ -649,11 +637,9 @@ async def situation_handler(message: Message):
     question = message.text.replace("/situation", "").strip()
 
     if not question:
-        await message.answer(
-            "Напиши вопрос после команды, например:\n\n"
-            "`/situation стоит ли мне менять работу?`",
-            
-        )
+        await message.answer("""Напиши вопрос после команды, например:
+
+/situation стоит ли мне менять работу?""")
         return
 
     seed = make_seed("situation", user["telegram_id"], today_str(), question)
@@ -666,16 +652,31 @@ async def situation_handler(message: Message):
         question_text=question,
     )
 
-    text = (
-        f"Вопрос: **{question}**\n\n"
-        "Расклад на ситуацию:\n\n"
-        f"**1. Суть ситуации:** {cards[0]} — {CARD_MEANINGS.get(cards[0])}\n\n"
-        f"**2. Что влияет скрыто:** {cards[1]} — {CARD_MEANINGS.get(cards[1])}\n\n"
-        f"**3. Возможное направление:** {cards[2]} — {CARD_MEANINGS.get(cards[2])}\n\n"
-        "Совет: воспринимай расклад как способ посмотреть на ситуацию под другим углом, а не как окончательное решение."
-    )
+    positions = [
+        ("Суть ситуации", cards[0]),
+        ("Что влияет скрыто", cards[1]),
+        ("Возможное направление", cards[2]),
+    ]
 
-    await message.answer(text)
+    await message.answer(f"""Вопрос: {question}
+
+Расклад на ситуацию:""")
+
+    for position, card in positions:
+        caption = f"""{position}: {card_title(card)}
+{get_card_meaning(card)}"""
+
+        image_url = get_card_image_url(card)
+
+        if image_url:
+            await message.answer_photo(photo=image_url, caption=caption)
+        else:
+            await message.answer(caption)
+
+    await message.answer(
+        "Совет: воспринимай расклад как способ посмотреть на ситуацию под другим углом, а не как окончательное решение.",
+        reply_markup=MAIN_MENU,
+    )
 
 @dp.message(F.text == "🌞 Карта дня")
 async def daily_card_button_handler(message: Message):
