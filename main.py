@@ -26,7 +26,7 @@ except ImportError:
     genai = None
 
 
-APP_VERSION = "2026-05-30-subscriptions-v12"
+APP_VERSION = "2026-05-30-user-text-moscow-bonus-v13"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
@@ -49,8 +49,9 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
-DEFAULT_TIMEZONE = "Europe/Berlin"
+DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_DAILY_POST_TIME = "08:00"
+DEFAULT_START_TOKENS = 8
 TZ = ZoneInfo(DEFAULT_TIMEZONE)
 
 
@@ -1106,12 +1107,27 @@ def get_or_create_user(message: Message):
             "timezone": DEFAULT_TIMEZONE,
             "daily_post_enabled": True,
             "daily_post_time": DEFAULT_DAILY_POST_TIME,
-            "token_balance": 0,
+            "token_balance": DEFAULT_START_TOKENS,
             "unlimited_tokens": telegram_id in UNLIMITED_TELEGRAM_IDS,
         })
 
         created = supabase.table("users").insert(payload).execute()
-        return created.data[0]
+        created_user = created.data[0]
+
+        if DEFAULT_START_TOKENS > 0:
+            try:
+                insert_token_transaction(
+                    user_id=created_user["id"],
+                    transaction_type="welcome_bonus",
+                    tokens_delta=DEFAULT_START_TOKENS,
+                    stars_amount=None,
+                    balance_after=DEFAULT_START_TOKENS,
+                    description=f"Приветственный бонус: {DEFAULT_START_TOKENS} токенов",
+                )
+            except Exception as bonus_exc:
+                print(f"[WELCOME_BONUS_LOG_ERROR] {bonus_exc}")
+
+        return created_user
     except Exception as exc:
         print(f"[USER_CREATE_EXTENDED_FIELDS_ERROR] {exc}")
 
@@ -1545,7 +1561,8 @@ def balance_text(user: dict) -> str:
 
     return (
         "💰 Баланс токенов\n\n"
-        f"У тебя сейчас: <b>{balance}</b> токенов.\n\n"
+        f"У тебя сейчас: <b>{balance}</b> токенов.\n"
+        f"Новым пользователям начисляется приветственный бонус: <b>{DEFAULT_START_TOKENS}</b> токенов.\n\n"
         "Стоимость раскладов:\n"
         f"🔮 Прошлое / Настоящее / Будущее — {THREE_READING_COST} токена\n"
         f"✍️ Расклад на ситуацию — {SITUATION_READING_COST} токенов\n"
@@ -2164,6 +2181,8 @@ async def start_handler(message: Message):
 
     text = f"""Привет. Я Tarot-бот 🔮
 
+Я помогаю посмотреть на день, ситуацию или личные темы через карты Таро: можно получить карту дня, расклад на 3 карты, карты рождения и интерпретацию своего вопроса.
+
 Выбери действие на кнопках ниже:
 
 🌞 Карта дня — личная карта до конца дня
@@ -2173,9 +2192,9 @@ async def start_handler(message: Message):
 💰 Баланс — пополнение токенов и подписка через Telegram Stars
 ⚙️ Автопостинг — ежедневная карта дня по расписанию
 
-Версия: {APP_VERSION}
+Для более детальных ответов желательно сразу заполнить дату и время рождения!
 
-Пока это развлекательный ботик. Не воспринимай расклады как финансовый, медицинский или юридический совет."""
+Если бот интерпретирует расклад или отправляет карты, пожалуйста, не нажимай кнопки много раз подряд. Немного подожди — бот обрабатывает запросы по очереди и обязательно ответит."""
 
     await message.answer(text, reply_markup=MAIN_MENU)
 
@@ -2690,16 +2709,16 @@ async def help_button_handler(message: Message):
 
 🧬 Карты рождения — персональный набор из 5 карт по дате и времени рождения.
 
-✍️ Расклад на ситуацию — ты пишешь вопрос, бот выбирает карты и даёт ИИ-интерпретацию на основе выпавших карт. Стоимость: {SITUATION_READING_COST} токенов.
+✍️ Расклад на ситуацию — ты пишешь вопрос, бот выбирает карты и даёт интерпретацию на основе выпавших карт. Стоимость: {SITUATION_READING_COST} токенов.
 
 📅 Сохранить дату рождения — нужно для персональных карт рождения.
 
 💰 Баланс — пополнение токенов и подписка через Telegram Stars
 ⚙️ Автопостинг — ежедневная карта дня по расписанию.
 
-Для администратора: /myid, /grant_unlimited, /revoke_unlimited, /unlimited_list
+Для более детальных ответов желательно сразу заполнить дату и время рождения!
 
-Версия: {APP_VERSION}"""
+Если бот долго отвечает, не отправляй один и тот же запрос много раз подряд. Немного подожди — бот всем ответит по очереди."""
 
     await message.answer(text, reply_markup=MAIN_MENU)
 
@@ -2786,6 +2805,9 @@ async def root():
             "clean_ai_output",
             "silent_unlimited_tokens",
             "star_subscriptions",
+            "moscow_default_timezone",
+            "welcome_bonus_tokens",
+            "clean_public_texts",
         ],
     }
 
