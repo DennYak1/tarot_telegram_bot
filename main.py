@@ -26,7 +26,7 @@ except ImportError:
     genai = None
 
 
-APP_VERSION = "2026-05-29-situation-ai-openrouter-v10"
+APP_VERSION = "2026-05-30-situation-ai-clean-v11"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
@@ -1340,9 +1340,10 @@ async def require_tokens_or_show_topup(
     fresh_user = get_user_by_internal_id(user["id"]) or user
 
     if user_has_unlimited_tokens(fresh_user):
-        await message.answer(
-            f"Безлимитный доступ активен ✅\n"
-            f"Услуга «{service_name}» доступна без списания токенов."
+        debit_tokens_from_user(
+            fresh_user,
+            cost,
+            description=f"Оплата услуги: {service_name}",
         )
         return True
 
@@ -1490,15 +1491,12 @@ async def send_daily_card_for_user(user: dict, chat_id: int | None = None, prefi
     card, local_date = get_or_create_daily_card_for_user(user)
     target_chat_id = chat_id or int(user["telegram_id"])
 
-    extra_text = f"<b>Дата:</b> {local_date}\nЭта карта закреплена за тобой до конца текущего дня."
-
     await send_card_to_chat_with_standard_description(
         target_chat_id,
         card,
         header=prefix,
         context="daily",
         position="Карта дня",
-        extra_text=extra_text,
     )
 
 async def send_birth_cards_for_message(message: Message, user: dict):
@@ -1575,10 +1573,6 @@ async def send_three_cards_for_message(message: Message, user: dict):
             position=position,
         )
 
-    if already_paid:
-        await message.answer("Этот расклад уже был оплачен и закреплён за тобой до конца текущего дня.")
-    else:
-        await message.answer("Этот расклад закреплён за тобой до конца текущего дня.")
 
 
 
@@ -1634,14 +1628,17 @@ def build_ai_situation_prompt(question: str, positions: list[tuple[str, dict]]) 
 - Не запугивай пользователя.
 - Не пиши мистический фатализм вроде «это точно случится».
 - Не говори, что ты искусственный интеллект.
-- Не используй Markdown-разметку: не ставь ###, **жирный**, таблицы и code block.
+- Не используй Markdown-разметку: не ставь заголовки через решётки, двойные звёздочки для жирного текста, таблицы и code block.
+- Не используй звёздочки для выделения текста.
 - Можно использовать простые заголовки текстом.
+- Обязательно закончи мысль. Не обрывай предложение на полуслове.
+- Если места не хватает, лучше сделай ответ короче, но доведи итог до завершения.
 
 Стиль:
 - живой, понятный, тёплый;
 - без канцелярита;
 - достаточно подробно, но без воды;
-- 1800–3000 знаков.
+- 1800–2400 знаков.
 
 Структура ответа:
 1. Общий смысл расклада
@@ -1668,7 +1665,7 @@ def call_openrouter_sync(prompt: str) -> str | None:
             }
         ],
         "temperature": 0.75,
-        "max_tokens": 1400,
+        "max_tokens": 2400,
     }
 
     headers = {
@@ -1794,13 +1791,32 @@ def fallback_situation_interpretation(question: str, positions: list[tuple[str, 
     return "\n".join(lines)
 
 
+def clean_ai_interpretation_text(text_value: str) -> str:
+    """Убирает Markdown-следы, которые иногда всё равно возвращают модели."""
+    if not text_value:
+        return ""
+
+    cleaned = str(text_value).strip()
+
+    # Markdown bold/italic markers.
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"__(.*?)__", r"\1", cleaned, flags=re.DOTALL)
+    cleaned = cleaned.replace("**", "")
+
+    # Markdown headings.
+    cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", cleaned)
+
+    return cleaned.strip()
+
+
 async def answer_ai_situation_interpretation(message: Message, question: str, positions: list[tuple[str, dict]]):
-    await message.answer("Собираю подробную ИИ-интерпретацию расклада… 🧠")
+    await message.answer("Интерпретирую расклад...")
 
     ai_text = await generate_ai_situation_interpretation(question, positions)
 
     if ai_text:
-        final_text = "<b>Подробная ИИ-интерпретация</b>\n\n" + html.escape(ai_text)
+        ai_text = clean_ai_interpretation_text(ai_text)
+        final_text = "<b>Подробная интерпретация</b>\n\n" + html.escape(ai_text)
     else:
         final_text = fallback_situation_interpretation(question, positions)
 
@@ -1851,11 +1867,6 @@ async def send_situation_reading_for_message(message: Message, user: dict, quest
         await answer_card(message, card, caption)
 
     await answer_ai_situation_interpretation(message, question, positions)
-
-    await message.answer(
-        "Совет: воспринимай расклад как способ посмотреть на ситуацию под другим углом, а не как окончательное решение.",
-        reply_markup=MAIN_MENU,
-    )
 
 
 async def save_birth_datetime_for_message(message: Message, user: dict, raw: str):
@@ -2514,6 +2525,8 @@ async def root():
             "telegram_stars_balance",
             "ai_situation_interpretation",
             "openrouter_ai_provider",
+            "clean_ai_output",
+            "silent_unlimited_tokens",
         ],
     }
 
