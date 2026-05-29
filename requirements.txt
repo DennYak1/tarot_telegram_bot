@@ -1,0 +1,6 @@
+aiogram==3.*
+fastapi
+uvicorn
+supabase
+python-dotenv
+tzdata
