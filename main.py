@@ -253,14 +253,15 @@ def today_str() -> str:
     return datetime.now(TZ).date().isoformat()
 
 def get_card_image_url(card: str) -> str | None:
-    if not BASE_URL:
-        return None
-
     filename = CARD_IMAGES.get(card)
+
     if not filename:
+        print(f"[CARD_IMAGE] Не найден файл для карты: {card}")
         return None
 
-    return f"{BASE_URL}/static/cards/{filename}"
+    public_base_url = BASE_URL or "https://tarot-telegram-bot-0hfs.onrender.com"
+
+    return f"{public_base_url.rstrip('/')}/static/cards/{filename}"
 
 def make_seed(*parts: str) -> int:
     raw = "|".join(str(part) for part in parts)
@@ -473,7 +474,7 @@ async def three_cards_handler(message: Message):
     await message.answer("Расклад на сегодня: прошлое / настоящее / будущее")
 
     for position, card in positions:
-        meaning = CARD_MEANINGS.get(card, "Толкование пока не добавлено.")
+        meaning = CARD_MEANINGS.get(card, "Толкование.........")
         image_url = get_card_image_url(card)
 
         caption = (
