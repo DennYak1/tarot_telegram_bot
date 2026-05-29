@@ -14,6 +14,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, Update
 from supabase import create_client
 
+from fastapi.staticfiles import StaticFiles
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -34,11 +35,105 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+CARD_IMAGES = {
+    # Старшие арканы
+    "Шут": "00-TheFool.jpg",
+    "Маг": "01-TheMagician.jpg",
+    "Верховная Жрица": "02-TheHighPriestess.jpg",
+    "Императрица": "03-TheEmpress.jpg",
+    "Император": "04-TheEmperor.jpg",
+    "Иерофант": "05-TheHierophant.jpg",
+    "Влюблённые": "06-TheLovers.jpg",
+    "Колесница": "07-TheChariot.jpg",
+    "Сила": "08-Strength.jpg",
+    "Отшельник": "09-TheHermit.jpg",
+    "Колесо Фортуны": "10-WheelOfFortune.jpg",
+    "Справедливость": "11-Justice.jpg",
+    "Повешенный": "12-TheHangedMan.jpg",
+    "Смерть": "13-Death.jpg",
+    "Умеренность": "14-Temperance.jpg",
+    "Дьявол": "15-TheDevil.jpg",
+    "Башня": "16-TheTower.jpg",
+    "Звезда": "17-TheStar.jpg",
+    "Луна": "18-TheMoon.jpg",
+    "Солнце": "19-TheSun.jpg",
+    "Суд": "20-Judgement.jpg",
+    "Мир": "21-TheWorld.jpg",
+
+    # Кубки
+    "Туз Кубков": "Cups01.jpg",
+    "Двойка Кубков": "Cups02.jpg",
+    "Тройка Кубков": "Cups03.jpg",
+    "Четвёрка Кубков": "Cups04.jpg",
+    "Пятёрка Кубков": "Cups05.jpg",
+    "Шестёрка Кубков": "Cups06.jpg",
+    "Семёрка Кубков": "Cups07.jpg",
+    "Восьмёрка Кубков": "Cups08.jpg",
+    "Девятка Кубков": "Cups09.jpg",
+    "Десятка Кубков": "Cups10.jpg",
+    "Паж Кубков": "Cups11.jpg",
+    "Рыцарь Кубков": "Cups12.jpg",
+    "Королева Кубков": "Cups13.jpg",
+    "Король Кубков": "Cups14.jpg",
+
+    # Пентакли
+    "Туз Пентаклей": "Pentacles01.jpg",
+    "Двойка Пентаклей": "Pentacles02.jpg",
+    "Тройка Пентаклей": "Pentacles03.jpg",
+    "Четвёрка Пентаклей": "Pentacles04.jpg",
+    "Пятёрка Пентаклей": "Pentacles05.jpg",
+    "Шестёрка Пентаклей": "Pentacles06.jpg",
+    "Семёрка Пентаклей": "Pentacles07.jpg",
+    "Восьмёрка Пентаклей": "Pentacles08.jpg",
+    "Девятка Пентаклей": "Pentacles09.jpg",
+    "Десятка Пентаклей": "Pentacles10.jpg",
+    "Паж Пентаклей": "Pentacles11.jpg",
+    "Рыцарь Пентаклей": "Pentacles12.jpg",
+    "Королева Пентаклей": "Pentacles13.jpg",
+    "Король Пентаклей": "Pentacles14.jpg",
+
+    # Мечи
+    "Туз Мечей": "Swords01.jpg",
+    "Двойка Мечей": "Swords02.jpg",
+    "Тройка Мечей": "Swords03.jpg",
+    "Четвёрка Мечей": "Swords04.jpg",
+    "Пятёрка Мечей": "Swords05.jpg",
+    "Шестёрка Мечей": "Swords06.jpg",
+    "Семёрка Мечей": "Swords07.jpg",
+    "Восьмёрка Мечей": "Swords08.jpg",
+    "Девятка Мечей": "Swords09.jpg",
+    "Десятка Мечей": "Swords10.jpg",
+    "Паж Мечей": "Swords11.jpg",
+    "Рыцарь Мечей": "Swords12.jpg",
+    "Королева Мечей": "Swords13.jpg",
+    "Король Мечей": "Swords14.jpg",
+
+    # Жезлы
+    "Туз Жезлов": "Wands01.jpg",
+    "Двойка Жезлов": "Wands02.jpg",
+    "Тройка Жезлов": "Wands03.jpg",
+    "Четвёрка Жезлов": "Wands04.jpg",
+    "Пятёрка Жезлов": "Wands05.jpg",
+    "Шестёрка Жезлов": "Wands06.jpg",
+    "Семёрка Жезлов": "Wands07.jpg",
+    "Восьмёрка Жезлов": "Wands08.jpg",
+    "Девятка Жезлов": "Wands09.jpg",
+    "Десятка Жезлов": "Wands10.jpg",
+    "Паж Жезлов": "Wands11.jpg",
+    "Рыцарь Жезлов": "Wands12.jpg",
+    "Королева Жезлов": "Wands13.jpg",
+    "Король Жезлов": "Wands14.jpg",
+
+    # Рубашка карты
+    "Рубашка": "CardBacks.jpg",
+}
 
 TAROT_CARDS = [
+    # Старшие арканы
     "Шут",
     "Маг",
     "Верховная Жрица",
@@ -61,6 +156,70 @@ TAROT_CARDS = [
     "Солнце",
     "Суд",
     "Мир",
+
+    # Кубки
+    "Туз Кубков",
+    "Двойка Кубков",
+    "Тройка Кубков",
+    "Четвёрка Кубков",
+    "Пятёрка Кубков",
+    "Шестёрка Кубков",
+    "Семёрка Кубков",
+    "Восьмёрка Кубков",
+    "Девятка Кубков",
+    "Десятка Кубков",
+    "Паж Кубков",
+    "Рыцарь Кубков",
+    "Королева Кубков",
+    "Король Кубков",
+
+    # Пентакли
+    "Туз Пентаклей",
+    "Двойка Пентаклей",
+    "Тройка Пентаклей",
+    "Четвёрка Пентаклей",
+    "Пятёрка Пентаклей",
+    "Шестёрка Пентаклей",
+    "Семёрка Пентаклей",
+    "Восьмёрка Пентаклей",
+    "Девятка Пентаклей",
+    "Десятка Пентаклей",
+    "Паж Пентаклей",
+    "Рыцарь Пентаклей",
+    "Королева Пентаклей",
+    "Король Пентаклей",
+
+    # Мечи
+    "Туз Мечей",
+    "Двойка Мечей",
+    "Тройка Мечей",
+    "Четвёрка Мечей",
+    "Пятёрка Мечей",
+    "Шестёрка Мечей",
+    "Семёрка Мечей",
+    "Восьмёрка Мечей",
+    "Девятка Мечей",
+    "Десятка Мечей",
+    "Паж Мечей",
+    "Рыцарь Мечей",
+    "Королева Мечей",
+    "Король Мечей",
+
+    # Жезлы
+    "Туз Жезлов",
+    "Двойка Жезлов",
+    "Тройка Жезлов",
+    "Четвёрка Жезлов",
+    "Пятёрка Жезлов",
+    "Шестёрка Жезлов",
+    "Семёрка Жезлов",
+    "Восьмёрка Жезлов",
+    "Девятка Жезлов",
+    "Десятка Жезлов",
+    "Паж Жезлов",
+    "Рыцарь Жезлов",
+    "Королева Жезлов",
+    "Король Жезлов",
 ]
 
 
@@ -93,7 +252,15 @@ CARD_MEANINGS = {
 def today_str() -> str:
     return datetime.now(TZ).date().isoformat()
 
+def get_card_image_url(card: str) -> str | None:
+    if not BASE_URL:
+        return None
 
+    filename = CARD_IMAGES.get(card)
+    if not filename:
+        return None
+
+    return f"{BASE_URL}/static/cards/{filename}"
 def make_seed(*parts: str) -> int:
     raw = "|".join(str(part) for part in parts)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -186,7 +353,12 @@ async def start_handler(message: Message):
         "Пока это развлекательный MVP, не воспринимай расклады как финансовый, медицинский или юридический совет."
     )
 
-    await message.answer(text)
+    image_url = get_card_image_url(card)
+
+    if image_url:
+        await message.answer_photo(photo=image_url, caption=text)
+    else:
+        await message.answer(text)
 
 
 @dp.message(Command("birth"))
@@ -270,7 +442,12 @@ async def daily_card_handler(message: Message):
         "Эта карта закреплена за тобой до конца текущего дня."
     )
 
-    await message.answer(text)
+    image_url = get_card_image_url(card)
+
+    if image_url:
+        await message.answer_photo(photo=image_url, caption=text)
+    else:
+        await message.answer(text)
 
 
 @dp.message(Command("three"))
