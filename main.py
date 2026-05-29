@@ -6,7 +6,7 @@ import asyncio
 import html
 import json
 from urllib import request as urllib_request, error as urllib_error
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -26,7 +26,7 @@ except ImportError:
     genai = None
 
 
-APP_VERSION = "2026-05-30-situation-ai-clean-v11"
+APP_VERSION = "2026-05-30-subscriptions-v12"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
@@ -505,32 +505,45 @@ SITUATION_READING_COST = 5
 MIN_TOPUP_STARS = 10
 
 # Цена в Telegram Stars -> сколько токенов начисляем.
-# Базово: 1 звезда = 1 токен. Чем больше пакет, тем выше бонус.
+# Тут меняется стоимость разовых пополнений токенов.
 TOKEN_PACKAGES = {
     "⭐ 10 звёзд → 10 токенов": {"stars": 10, "tokens": 10},
-    "⭐ 25 звёзд → 28 токенов": {"stars": 25, "tokens": 28},
-    "⭐ 50 звёзд → 60 токенов": {"stars": 50, "tokens": 60},
-    "⭐ 100 звёзд → 130 токенов": {"stars": 100, "tokens": 130},
-    "⭐ 250 звёзд → 350 токенов": {"stars": 250, "tokens": 350},
+    "⭐ 25 звёзд → 30 токенов": {"stars": 25, "tokens": 30},
+    "⭐ 50 звёзд → 70 токенов": {"stars": 50, "tokens": 70},
+    "⭐ 100 звёзд → 150 токенов": {"stars": 100, "tokens": 150},
+    "⭐ 250 звёзд → 500 токенов": {"stars": 250, "tokens": 500},
+}
+
+# Подписка даёт доступ ко всем платным раскладам без списания токенов.
+# Это не автопродление, а разовая покупка доступа на срок.
+SUBSCRIPTION_PACKAGES = {
+    "♾ Подписка на месяц — 200 ⭐": {"stars": 200, "days": 30, "plan": "month", "title": "Подписка на месяц"},
+    "♾ Подписка на год — 2000 ⭐": {"stars": 2000, "days": 365, "plan": "year", "title": "Подписка на год"},
 }
 
 BALANCE_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(text="⭐ 10 звёзд → 10 токенов"),
-            KeyboardButton(text="⭐ 25 звёзд → 28 токенов"),
+            KeyboardButton(text="⭐ 25 звёзд → 30 токенов"),
         ],
         [
-            KeyboardButton(text="⭐ 50 звёзд → 60 токенов"),
-            KeyboardButton(text="⭐ 100 звёзд → 130 токенов"),
+            KeyboardButton(text="⭐ 50 звёзд → 70 токенов"),
+            KeyboardButton(text="⭐ 100 звёзд → 150 токенов"),
         ],
         [
-            KeyboardButton(text="⭐ 250 звёзд → 350 токенов"),
+            KeyboardButton(text="⭐ 250 звёзд → 500 токенов"),
+        ],
+        [
+            KeyboardButton(text="♾ Подписка на месяц — 200 ⭐"),
+            KeyboardButton(text="♾ Подписка на год — 2000 ⭐"),
+        ],
+        [
             KeyboardButton(text="⬅️ Главное меню"),
         ],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Пополнить баланс токенов",
+    input_field_placeholder="Пополнить баланс токенов или оформить подписку",
 )
 
 
@@ -1181,6 +1194,56 @@ def user_has_unlimited_tokens(user: dict | None) -> bool:
     return bool(user.get("unlimited_tokens", False))
 
 
+def parse_subscription_until(value) -> datetime | None:
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        result = value
+    else:
+        raw = str(value).strip().replace("Z", "+00:00")
+        try:
+            result = datetime.fromisoformat(raw)
+        except ValueError:
+            print(f"[SUBSCRIPTION_DATE_PARSE_ERROR] {value}")
+            return None
+
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+
+    return result
+
+
+def user_subscription_until(user: dict | None) -> datetime | None:
+    if not user:
+        return None
+
+    return parse_subscription_until(user.get("subscription_until"))
+
+
+def user_has_active_subscription(user: dict | None) -> bool:
+    until = user_subscription_until(user)
+
+    if not until:
+        return False
+
+    now = datetime.now(until.tzinfo or timezone.utc)
+    return until > now
+
+
+def format_subscription_until(user: dict | None) -> str:
+    until = user_subscription_until(user)
+
+    if not until:
+        return "не активна"
+
+    return until.astimezone(safe_timezone(user_timezone(user))).strftime("%Y-%m-%d %H:%M")
+
+
+def user_has_paid_full_access(user: dict | None) -> bool:
+    return user_has_unlimited_tokens(user) or user_has_active_subscription(user)
+
+
 def user_is_admin(user: dict | None) -> bool:
     telegram_id = user_telegram_id(user)
     return bool(telegram_id and telegram_id in ADMIN_TELEGRAM_IDS)
@@ -1213,6 +1276,21 @@ def package_by_stars(stars: int) -> dict | None:
     for package in TOKEN_PACKAGES.values():
         if package["stars"] == stars:
             return package
+    return None
+
+
+def subscription_by_button_text(text_value: str) -> dict | None:
+    return SUBSCRIPTION_PACKAGES.get(text_value)
+
+
+def subscription_by_plan(plan: str | None) -> dict | None:
+    if not plan:
+        return None
+
+    for package in SUBSCRIPTION_PACKAGES.values():
+        if package["plan"] == plan:
+            return package
+
     return None
 
 
@@ -1297,6 +1375,51 @@ def add_tokens_to_user(
     return new_balance
 
 
+def add_subscription_to_user(
+    user: dict,
+    plan: str,
+    days: int,
+    stars_amount: int,
+    description: str | None = None,
+    telegram_payment_charge_id: str | None = None,
+    provider_payment_charge_id: str | None = None,
+    payload: str | None = None,
+) -> datetime:
+    fresh_user = get_user_by_internal_id(user["id"]) or user
+
+    now = datetime.now(timezone.utc)
+    current_until = user_subscription_until(fresh_user)
+
+    if current_until and current_until > now:
+        start_from = current_until.astimezone(timezone.utc)
+    else:
+        start_from = now
+
+    new_until = start_from + timedelta(days=int(days))
+
+    update_user(
+        fresh_user["id"],
+        {
+            "subscription_plan": plan,
+            "subscription_until": new_until.isoformat(),
+        },
+    )
+
+    insert_token_transaction(
+        user_id=fresh_user["id"],
+        transaction_type="subscription",
+        tokens_delta=0,
+        stars_amount=stars_amount,
+        balance_after=user_token_balance(fresh_user),
+        description=description or f"Подписка {plan} на {days} дней",
+        telegram_payment_charge_id=telegram_payment_charge_id,
+        provider_payment_charge_id=provider_payment_charge_id,
+        payload=payload,
+    )
+
+    return new_until
+
+
 def debit_tokens_from_user(user: dict, tokens: int, description: str) -> tuple[bool, int]:
     fresh_user = get_user_by_internal_id(user["id"]) or user
     current_balance = user_token_balance(fresh_user)
@@ -1347,6 +1470,17 @@ async def require_tokens_or_show_topup(
         )
         return True
 
+    if user_has_active_subscription(fresh_user):
+        insert_token_transaction(
+            user_id=fresh_user["id"],
+            transaction_type="subscription_access",
+            tokens_delta=0,
+            stars_amount=None,
+            balance_after=user_token_balance(fresh_user),
+            description=f"Доступ по подписке: {service_name}",
+        )
+        return True
+
     balance = user_token_balance(fresh_user)
 
     if balance >= cost:
@@ -1365,7 +1499,7 @@ async def require_tokens_or_show_topup(
     await message.answer(
         f"Для услуги «{service_name}» нужно {cost} токенов.\n"
         f"Твой баланс: {balance} токенов.\n\n"
-        "Пополнить баланс можно Telegram Stars. Минимальное пополнение — 10 звёзд.",
+        "Можно пополнить баланс Telegram Stars или оформить подписку на все расклады.",
         reply_markup=BALANCE_MENU,
     )
     return False
@@ -1381,28 +1515,46 @@ def balance_text(user: dict) -> str:
         coefficient = tokens / stars
         package_lines.append(f"⭐ {stars} звёзд → {tokens} токенов ×{coefficient:.2f}")
 
+    subscription_lines = []
+    for package in SUBSCRIPTION_PACKAGES.values():
+        subscription_lines.append(
+            f"♾ {package['title']} — {package['stars']} ⭐"
+        )
+
     if user_has_unlimited_tokens(user):
         return (
             "💰 Баланс токенов\n\n"
             "У тебя активен <b>безлимитный доступ</b> ✅\n\n"
-            "Платные расклады доступны без списания токенов:\n"
+            "Все платные расклады доступны без списания токенов:\n"
             f"🔮 Прошлое / Настоящее / Будущее — обычно {THREE_READING_COST} токена\n"
             f"✍️ Расклад на ситуацию — обычно {SITUATION_READING_COST} токенов\n\n"
-            "Пополнение баланса тебе не требуется, но меню пополнения остаётся доступным."
+            "Пополнение и подписка тебе не требуются, но меню остаётся доступным."
+        )
+
+    if user_has_active_subscription(user):
+        return (
+            "💰 Баланс токенов\n\n"
+            f"У тебя активна <b>подписка на все расклады</b> ✅\n"
+            f"Действует до: <b>{format_subscription_until(user)}</b>\n\n"
+            f"Токенов на балансе: <b>{balance}</b>\n\n"
+            "Пока подписка активна, платные расклады доступны без списания токенов:\n"
+            f"🔮 Прошлое / Настоящее / Будущее — обычно {THREE_READING_COST} токена\n"
+            f"✍️ Расклад на ситуацию — обычно {SITUATION_READING_COST} токенов\n\n"
+            "Можно продлить подписку заранее — новый срок добавится к текущему."
         )
 
     return (
         "💰 Баланс токенов\n\n"
         f"У тебя сейчас: <b>{balance}</b> токенов.\n\n"
-        "Курс:\n"
-        "1 звезда = 1 токен. При больших пополнениях начисляется бонус.\n\n"
         "Стоимость раскладов:\n"
         f"🔮 Прошлое / Настоящее / Будущее — {THREE_READING_COST} токена\n"
         f"✍️ Расклад на ситуацию — {SITUATION_READING_COST} токенов\n"
         "🌞 Карта дня — бесплатно\n"
         "🧬 Карты рождения — бесплатно\n\n"
-        "Пакеты пополнения:\n"
+        "Разовые пополнения:\n"
         + "\n".join(package_lines)
+        + "\n\nПодписка на все расклады:\n"
+        + "\n".join(subscription_lines)
     )
 
 async def show_balance(message: Message):
@@ -1432,6 +1584,33 @@ async def send_topup_invoice(message: Message, package: dict):
         prices=[
             LabeledPrice(
                 label=f"{tokens} токенов",
+                amount=stars,
+            )
+        ],
+    )
+
+
+
+async def send_subscription_invoice(message: Message, package: dict):
+    stars = int(package["stars"])
+    days = int(package["days"])
+    plan = str(package["plan"])
+    title = str(package["title"])
+
+    payload = f"subscription:{message.from_user.id}:{plan}:{stars}:{days}"
+
+    await message.answer_invoice(
+        title=title,
+        description=(
+            f"{title}: доступ ко всем платным раскладам на {days} дней. "
+            "Пока подписка активна, токены за расклады не списываются."
+        ),
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[
+            LabeledPrice(
+                label=title,
                 amount=stars,
             )
         ],
@@ -1991,7 +2170,7 @@ async def start_handler(message: Message):
 🔮 Прошлое / Настоящее / Будущее — расклад на 3 карты, стоимость 3 токена
 🧬 Карты рождения — 5 карт по дате и времени рождения
 ✍️ Расклад на ситуацию — задай свой вопрос, стоимость 5 токенов
-💰 Баланс — пополнение токенов через Telegram Stars
+💰 Баланс — пополнение токенов и подписка через Telegram Stars
 ⚙️ Автопостинг — ежедневная карта дня по расписанию
 
 Версия: {APP_VERSION}
@@ -2231,10 +2410,10 @@ async def balance_button_handler(message: Message):
 
 
 @dp.message(F.text == "⭐ 10 звёзд → 10 токенов")
-@dp.message(F.text == "⭐ 25 звёзд → 28 токенов")
-@dp.message(F.text == "⭐ 50 звёзд → 60 токенов")
-@dp.message(F.text == "⭐ 100 звёзд → 130 токенов")
-@dp.message(F.text == "⭐ 250 звёзд → 350 токенов")
+@dp.message(F.text == "⭐ 25 звёзд → 30 токенов")
+@dp.message(F.text == "⭐ 50 звёзд → 70 токенов")
+@dp.message(F.text == "⭐ 100 звёзд → 150 токенов")
+@dp.message(F.text == "⭐ 250 звёзд → 500 токенов")
 async def topup_package_handler(message: Message):
     package = package_by_button_text(message.text or "")
 
@@ -2245,6 +2424,18 @@ async def topup_package_handler(message: Message):
     await send_topup_invoice(message, package)
 
 
+@dp.message(F.text == "♾ Подписка на месяц — 200 ⭐")
+@dp.message(F.text == "♾ Подписка на год — 2000 ⭐")
+async def subscription_package_handler(message: Message):
+    package = subscription_by_button_text(message.text or "")
+
+    if not package:
+        await message.answer("Не получилось определить пакет подписки.", reply_markup=BALANCE_MENU)
+        return
+
+    await send_subscription_invoice(message, package)
+
+
 @dp.pre_checkout_query()
 async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
     payload = pre_checkout_query.invoice_payload or ""
@@ -2252,27 +2443,42 @@ async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
     if pre_checkout_query.currency != "XTR":
         await pre_checkout_query.answer(
             ok=False,
-            error_message="Для пополнения баланса используются только Telegram Stars.",
+            error_message="Для оплаты используются только Telegram Stars.",
         )
         return
 
-    if not payload.startswith("topup:"):
-        await pre_checkout_query.answer(
-            ok=False,
-            error_message="Неизвестный тип платежа.",
-        )
+    if payload.startswith("topup:"):
+        package = package_by_stars(int(pre_checkout_query.total_amount))
+
+        if not package or int(pre_checkout_query.total_amount) < MIN_TOPUP_STARS:
+            await pre_checkout_query.answer(
+                ok=False,
+                error_message=f"Минимальное пополнение — {MIN_TOPUP_STARS} звёзд.",
+            )
+            return
+
+        await pre_checkout_query.answer(ok=True)
         return
 
-    package = package_by_stars(int(pre_checkout_query.total_amount))
+    if payload.startswith("subscription:"):
+        parts = payload.split(":")
+        plan = parts[2] if len(parts) >= 3 else None
+        package = subscription_by_plan(plan)
 
-    if not package or int(pre_checkout_query.total_amount) < MIN_TOPUP_STARS:
-        await pre_checkout_query.answer(
-            ok=False,
-            error_message=f"Минимальное пополнение — {MIN_TOPUP_STARS} звёзд.",
-        )
+        if not package or int(pre_checkout_query.total_amount) != int(package["stars"]):
+            await pre_checkout_query.answer(
+                ok=False,
+                error_message="Не удалось проверить пакет подписки.",
+            )
+            return
+
+        await pre_checkout_query.answer(ok=True)
         return
 
-    await pre_checkout_query.answer(ok=True)
+    await pre_checkout_query.answer(
+        ok=False,
+        error_message="Неизвестный тип платежа.",
+    )
 
 
 @dp.message(F.successful_payment)
@@ -2284,7 +2490,7 @@ async def successful_payment_handler(message: Message):
         return
 
     if payment.currency != "XTR":
-        await message.answer("Этот платёж не в Telegram Stars, токены не начислены.", reply_markup=MAIN_MENU)
+        await message.answer("Этот платёж не в Telegram Stars, доступ не начислен.", reply_markup=MAIN_MENU)
         return
 
     charge_id = payment.telegram_payment_charge_id
@@ -2297,34 +2503,86 @@ async def successful_payment_handler(message: Message):
         )
         return
 
-    stars = int(payment.total_amount)
-    package = package_by_stars(stars)
+    payload = payment.invoice_payload or ""
+    user = get_or_create_user(message)
 
-    if not package:
+    if payload.startswith("subscription:"):
+        parts = payload.split(":")
+        plan = parts[2] if len(parts) >= 3 else None
+        package = subscription_by_plan(plan)
+
+        if not package:
+            await message.answer(
+                "Не получилось определить пакет подписки. Напиши в поддержку через /paysupport.",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        stars = int(payment.total_amount)
+
+        if stars != int(package["stars"]):
+            await message.answer(
+                "Сумма платежа не совпала с пакетом подписки. Напиши в поддержку через /paysupport.",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        add_subscription_to_user(
+            user,
+            plan=str(package["plan"]),
+            days=int(package["days"]),
+            stars_amount=stars,
+            description=f"{package['title']}: {stars} звёзд, доступ на {package['days']} дней",
+            telegram_payment_charge_id=payment.telegram_payment_charge_id,
+            provider_payment_charge_id=payment.provider_payment_charge_id,
+            payload=payment.invoice_payload,
+        )
+
+        user_after = get_user_by_internal_id(user["id"]) or user
         await message.answer(
-            "Не получилось определить пакет пополнения. Напиши в поддержку через /paysupport.",
+            "Подписка активирована ✅\n\n"
+            f"Пакет: {package['title']}\n"
+            f"Списано Stars: {stars}\n"
+            f"Доступ действует до: {format_subscription_until(user_after)}\n\n"
+            "Теперь платные расклады доступны без списания токенов до окончания подписки.",
             reply_markup=MAIN_MENU,
         )
         return
 
-    tokens = int(package["tokens"])
-    user = get_or_create_user(message)
+    if payload.startswith("topup:"):
+        stars = int(payment.total_amount)
+        package = package_by_stars(stars)
 
-    new_balance = add_tokens_to_user(
-        user,
-        tokens=tokens,
-        stars_amount=stars,
-        description=f"Пополнение баланса через Telegram Stars: {stars} звёзд → {tokens} токенов",
-        telegram_payment_charge_id=payment.telegram_payment_charge_id,
-        provider_payment_charge_id=payment.provider_payment_charge_id,
-        payload=payment.invoice_payload,
-    )
+        if not package:
+            await message.answer(
+                "Не получилось определить пакет пополнения. Напиши в поддержку через /paysupport.",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        tokens = int(package["tokens"])
+
+        new_balance = add_tokens_to_user(
+            user,
+            tokens=tokens,
+            stars_amount=stars,
+            description=f"Пополнение баланса через Telegram Stars: {stars} звёзд → {tokens} токенов",
+            telegram_payment_charge_id=payment.telegram_payment_charge_id,
+            provider_payment_charge_id=payment.provider_payment_charge_id,
+            payload=payment.invoice_payload,
+        )
+
+        await message.answer(
+            f"Оплата прошла успешно ✅\n\n"
+            f"Начислено: {tokens} токенов\n"
+            f"Списано Stars: {stars}\n"
+            f"Текущий баланс: {new_balance} токенов",
+            reply_markup=MAIN_MENU,
+        )
+        return
 
     await message.answer(
-        f"Оплата прошла успешно ✅\n\n"
-        f"Начислено: {tokens} токенов\n"
-        f"Списано Stars: {stars}\n"
-        f"Текущий баланс: {new_balance} токенов",
+        "Неизвестный тип платежа. Напиши в поддержку через /paysupport.",
         reply_markup=MAIN_MENU,
     )
 
@@ -2436,7 +2694,7 @@ async def help_button_handler(message: Message):
 
 📅 Сохранить дату рождения — нужно для персональных карт рождения.
 
-💰 Баланс — пополнение токенов через Telegram Stars
+💰 Баланс — пополнение токенов и подписка через Telegram Stars
 ⚙️ Автопостинг — ежедневная карта дня по расписанию.
 
 Для администратора: /myid, /grant_unlimited, /revoke_unlimited, /unlimited_list
@@ -2527,6 +2785,7 @@ async def root():
             "openrouter_ai_provider",
             "clean_ai_output",
             "silent_unlimited_tokens",
+            "star_subscriptions",
         ],
     }
 
