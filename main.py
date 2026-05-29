@@ -9,9 +9,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 from fastapi import FastAPI, Request
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, Update
+from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton
 from supabase import create_client
 
 from fastapi.staticfiles import StaticFiles
@@ -249,6 +249,27 @@ CARD_MEANINGS = {
 }
 
 
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="🌞 Карта дня"),
+            KeyboardButton(text="🔮 3 карты"),
+        ],
+        [
+            KeyboardButton(text="🧬 Карты рождения"),
+            KeyboardButton(text="✍️ Расклад на ситуацию"),
+        ],
+        [
+            KeyboardButton(text="📅 Сохранить дату рождения"),
+            KeyboardButton(text="ℹ️ Помощь"),
+        ],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите действие"
+)
+
+USER_WAITING_ACTION = {}
+
 def today_str() -> str:
     return datetime.now(TZ).date().isoformat()
 
@@ -346,14 +367,15 @@ async def start_handler(message: Message):
 
     text = (
         "Привет. Я Tarot-бот 🔮\n\n"
-        "Что я умею:\n"
-        "/birth 2000-05-17 14:30 — сохранить дату и время рождения\n"
-        "/birth_cards — личный набор карт по дате рождения\n"
-        "/day — карта дня\n"
-        "/three — прошлое / настоящее / будущее\n"
-        "/situation твой вопрос — расклад на ситуацию\n\n"
-        "Пока это развлекательный MVP, не воспринимай расклады как финансовый, медицинский или юридический совет."
+        "Выбери действие на кнопках ниже:\n\n"
+        "🌞 Карта дня — личная карта до конца дня\n"
+        "🔮 3 карты — прошлое / настоящее / будущее\n"
+        "🧬 Карты рождения — 5 карт по дате и времени рождения\n"
+        "✍️ Расклад на ситуацию — задай свой вопрос\n\n"
+        "Пока это развлекательный ботик. Не воспринимай расклады как финансовый, медицинский или юридический совет."
     )
+
+    await message.answer(text, reply_markup=MAIN_MENU)
 
     image_url = get_card_image_url(card)
 
@@ -525,7 +547,107 @@ async def situation_handler(message: Message):
 
     await message.answer(text)
 
+@dp.message(F.text == "🌞 Карта дня")
+async def daily_card_button_handler(message: Message):
+    await daily_card_handler(message)
 
+
+@dp.message(F.text == "🔮 3 карты")
+async def three_cards_button_handler(message: Message):
+    await three_cards_handler(message)
+
+
+@dp.message(F.text == "🧬 Карты рождения")
+async def birth_cards_button_handler(message: Message):
+    await birth_cards_handler(message)
+
+
+@dp.message(F.text == "📅 Сохранить дату рождения")
+async def ask_birth_datetime_handler(message: Message):
+    USER_WAITING_ACTION[message.from_user.id] = "birth_datetime"
+
+    await message.answer(
+        "Напиши дату и время рождения в формате:\n\n"
+        "2000-05-17 14:30"
+    )
+
+
+@dp.message(F.text == "✍️ Расклад на ситуацию")
+async def ask_situation_handler(message: Message):
+    USER_WAITING_ACTION[message.from_user.id] = "situation"
+
+    await message.answer(
+        "Опиши ситуацию или задай вопрос.\n\n"
+        "Например:\n"
+        "Стоит ли мне менять работу?"
+    )
+
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def help_button_handler(message: Message):
+    text = (
+        "Что умеет бот:\n\n"
+        "🌞 Карта дня — одна карта, закреплена за тобой до конца дня.\n\n"
+        "🔮 3 карты — расклад прошлое / настоящее / будущее. "
+        "Тоже закрепляется до конца текущего дня.\n\n"
+        "🧬 Карты рождения — персональный набор из 5 карт по дате и времени рождения.\n\n"
+        "✍️ Расклад на ситуацию — ты пишешь вопрос, бот выбирает карты и даёт трактовку.\n\n"
+        "📅 Сохранить дату рождения — нужно для персональных карт рождения."
+    )
+
+    await message.answer(text, reply_markup=MAIN_MENU)
+
+@dp.message()
+async def plain_text_handler(message: Message):
+    user_id = message.from_user.id
+    action = USER_WAITING_ACTION.get(user_id)
+
+    if action == "birth_datetime":
+        raw = message.text.strip()
+
+        try:
+            datetime.strptime(raw, "%Y-%m-%d %H:%M")
+        except ValueError:
+            await message.answer(
+                "Не получилось распознать дату.\n\n"
+                "Напиши в формате:\n"
+                "2000-05-17 14:30"
+            )
+            return
+
+        USER_WAITING_ACTION.pop(user_id, None)
+
+        message.text = f"/birth {raw}"
+        await birth_handler(message)
+
+        await message.answer(
+            "Теперь можно открыть карты рождения.",
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    if action == "situation":
+        question = message.text.strip()
+
+        if not question:
+            await message.answer("Напиши вопрос или коротко опиши ситуацию.")
+            return
+
+        USER_WAITING_ACTION.pop(user_id, None)
+
+        message.text = f"/situation {question}"
+        await situation_handler(message)
+
+        await message.answer(
+            "Можешь выбрать следующий расклад.",
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    await message.answer(
+        "Выбери действие на кнопках ниже.",
+        reply_markup=MAIN_MENU
+    )
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "tarot-bot"}
