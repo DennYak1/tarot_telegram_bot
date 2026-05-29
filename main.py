@@ -18,7 +18,7 @@ from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton, 
 from supabase import create_client
 
 
-APP_VERSION = "2026-05-29-card-descriptions-v4"
+APP_VERSION = "2026-05-29-unlimited-tokens-v7"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
@@ -31,6 +31,29 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 DEFAULT_TIMEZONE = "Europe/Berlin"
 DEFAULT_DAILY_POST_TIME = "08:00"
 TZ = ZoneInfo(DEFAULT_TIMEZONE)
+
+
+def parse_telegram_id_set(value: str | None) -> set[int]:
+    """Парсит список Telegram ID из env: 123,456 789;101."""
+    result: set[int] = set()
+
+    if not value:
+        return result
+
+    for item in re.split(r"[,;\s]+", value.strip()):
+        if not item:
+            continue
+
+        try:
+            result.add(int(item))
+        except ValueError:
+            print(f"[CONFIG_WARNING] Некорректный Telegram ID в env: {item}")
+
+    return result
+
+
+ADMIN_TELEGRAM_IDS = parse_telegram_id_set(os.getenv("ADMIN_TELEGRAM_IDS", ""))
+UNLIMITED_TELEGRAM_IDS = parse_telegram_id_set(os.getenv("UNLIMITED_TELEGRAM_IDS", ""))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -614,6 +637,23 @@ async def answer_card(message: Message, card, caption: str):
     await message.answer(caption, parse_mode="HTML")
 
 
+async def answer_card_with_standard_description(
+    message: Message,
+    card,
+    header: str,
+    context: str,
+    position: str | None = None,
+):
+    """Безопасная отправка карты с обычным стандартным описанием.
+
+    Нужна как fallback, если в файле нет расширенного блока описаний.
+    """
+    caption = f"""<b>{header}:</b> {card_title(card)}
+
+<b>Смысл карты:</b> {get_card_meaning(card)}"""
+    await answer_card(message, card, caption)
+
+
 async def send_card_to_chat(chat_id: int, card, caption: str):
     image_url = get_card_image_url(card)
 
@@ -654,6 +694,7 @@ def get_or_create_user(message: Message):
             "daily_post_enabled": True,
             "daily_post_time": DEFAULT_DAILY_POST_TIME,
             "token_balance": 0,
+            "unlimited_tokens": telegram_id in UNLIMITED_TELEGRAM_IDS,
         })
 
         created = supabase.table("users").insert(payload).execute()
@@ -714,6 +755,42 @@ def user_daily_enabled(user: dict | None) -> bool:
     if value is None:
         return True
     return bool(value)
+
+
+def user_telegram_id(user: dict | None) -> int | None:
+    if not user:
+        return None
+
+    value = user.get("telegram_id")
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def user_has_unlimited_tokens(user: dict | None) -> bool:
+    if not user:
+        return False
+
+    telegram_id = user_telegram_id(user)
+
+    if telegram_id in UNLIMITED_TELEGRAM_IDS:
+        return True
+
+    return bool(user.get("unlimited_tokens", False))
+
+
+def user_is_admin(user: dict | None) -> bool:
+    telegram_id = user_telegram_id(user)
+    return bool(telegram_id and telegram_id in ADMIN_TELEGRAM_IDS)
+
+
+def display_token_balance(user: dict | None) -> str:
+    if user_has_unlimited_tokens(user):
+        return "∞"
+
+    return str(user_token_balance(user))
 
 
 def user_token_balance(user: dict | None) -> int:
@@ -825,14 +902,25 @@ def debit_tokens_from_user(user: dict, tokens: int, description: str) -> tuple[b
     current_balance = user_token_balance(fresh_user)
     cost = int(tokens)
 
+    if user_has_unlimited_tokens(fresh_user):
+        insert_token_transaction(
+            user_id=fresh_user["id"],
+            transaction_type="unlimited_charge",
+            tokens_delta=0,
+            stars_amount=None,
+            balance_after=current_balance,
+            description=f"Безлимитный доступ: {description}",
+        )
+        return True, current_balance
+
     if current_balance < cost:
         return False, current_balance
 
     new_balance = current_balance - cost
-    update_user(user["id"], {"token_balance": new_balance})
+    update_user(fresh_user["id"], {"token_balance": new_balance})
 
     insert_token_transaction(
-        user_id=user["id"],
+        user_id=fresh_user["id"],
         transaction_type="charge",
         tokens_delta=-cost,
         stars_amount=None,
@@ -850,6 +938,14 @@ async def require_tokens_or_show_topup(
     service_name: str,
 ) -> bool:
     fresh_user = get_user_by_internal_id(user["id"]) or user
+
+    if user_has_unlimited_tokens(fresh_user):
+        await message.answer(
+            f"Безлимитный доступ активен ✅\n"
+            f"Услуга «{service_name}» доступна без списания токенов."
+        )
+        return True
+
     balance = user_token_balance(fresh_user)
 
     if balance >= cost:
@@ -884,6 +980,16 @@ def balance_text(user: dict) -> str:
         coefficient = tokens / stars
         package_lines.append(f"⭐ {stars} звёзд → {tokens} токенов ×{coefficient:.2f}")
 
+    if user_has_unlimited_tokens(user):
+        return (
+            "💰 Баланс токенов\n\n"
+            "У тебя активен <b>безлимитный доступ</b> ✅\n\n"
+            "Платные расклады доступны без списания токенов:\n"
+            f"🔮 Прошлое / Настоящее / Будущее — обычно {THREE_READING_COST} токена\n"
+            f"✍️ Расклад на ситуацию — обычно {SITUATION_READING_COST} токенов\n\n"
+            "Пополнение баланса тебе не требуется, но меню пополнения остаётся доступным."
+        )
+
     return (
         "💰 Баланс токенов\n\n"
         f"У тебя сейчас: <b>{balance}</b> токенов.\n\n"
@@ -897,7 +1003,6 @@ def balance_text(user: dict) -> str:
         "Пакеты пополнения:\n"
         + "\n".join(package_lines)
     )
-
 
 async def show_balance(message: Message):
     user = get_or_create_user(message)
@@ -1328,6 +1433,154 @@ async def paysupport_handler(message: Message):
     )
 
 
+@dp.message(Command("myid"))
+async def myid_handler(message: Message):
+    await message.answer(
+        f"Твой Telegram ID: <code>{message.from_user.id}</code>",
+        parse_mode="HTML",
+        reply_markup=MAIN_MENU,
+    )
+
+
+@dp.message(Command("grant_unlimited"))
+async def grant_unlimited_handler(message: Message):
+    admin_user = get_or_create_user(message)
+
+    if not user_is_admin(admin_user):
+        await message.answer(
+            "Эта команда доступна только администратору. "
+            "Добавь свой Telegram ID в переменную окружения ADMIN_TELEGRAM_IDS на Render."
+        )
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи Telegram ID пользователя:\n\n"
+            "/grant_unlimited 123456789"
+        )
+        return
+
+    try:
+        target_telegram_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("Telegram ID должен быть числом.")
+        return
+
+    target_user = get_user_by_telegram_id(target_telegram_id)
+
+    if not target_user:
+        await message.answer(
+            "Пользователь не найден в базе. Он должен хотя бы один раз написать боту /start."
+        )
+        return
+
+    try:
+        update_user(target_user["id"], {"unlimited_tokens": True})
+        await message.answer(
+            f"Безлимитный доступ включён ✅\n"
+            f"Telegram ID: <code>{target_telegram_id}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await message.answer(
+            "Не удалось включить безлимит. Проверь, что в Supabase добавлена колонка "
+            "<code>unlimited_tokens</code>.\n\n"
+            f"{exc}",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(Command("revoke_unlimited"))
+async def revoke_unlimited_handler(message: Message):
+    admin_user = get_or_create_user(message)
+
+    if not user_is_admin(admin_user):
+        await message.answer(
+            "Эта команда доступна только администратору. "
+            "Добавь свой Telegram ID в переменную окружения ADMIN_TELEGRAM_IDS на Render."
+        )
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи Telegram ID пользователя:\n\n"
+            "/revoke_unlimited 123456789"
+        )
+        return
+
+    try:
+        target_telegram_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("Telegram ID должен быть числом.")
+        return
+
+    target_user = get_user_by_telegram_id(target_telegram_id)
+
+    if not target_user:
+        await message.answer("Пользователь не найден в базе.")
+        return
+
+    update_user(target_user["id"], {"unlimited_tokens": False})
+
+    await message.answer(
+        f"Безлимитный доступ выключен 🚫\n"
+        f"Telegram ID: <code>{target_telegram_id}</code>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("unlimited_list"))
+async def unlimited_list_handler(message: Message):
+    admin_user = get_or_create_user(message)
+
+    if not user_is_admin(admin_user):
+        await message.answer(
+            "Эта команда доступна только администратору."
+        )
+        return
+
+    try:
+        result = (
+            supabase.table("users")
+            .select("telegram_id, username, first_name, token_balance, unlimited_tokens")
+            .eq("unlimited_tokens", True)
+            .execute()
+        )
+    except Exception as exc:
+        await message.answer(
+            "Не удалось получить список. Проверь колонку unlimited_tokens в Supabase.\n\n"
+            f"{exc}"
+        )
+        return
+
+    env_ids = sorted(UNLIMITED_TELEGRAM_IDS)
+    lines = ["Аккаунты с безлимитным доступом:\n"]
+
+    if env_ids:
+        lines.append("<b>Через переменную UNLIMITED_TELEGRAM_IDS:</b>")
+        for telegram_id in env_ids:
+            lines.append(f"• <code>{telegram_id}</code>")
+
+    db_users = result.data or []
+    if db_users:
+        lines.append("\n<b>Через Supabase unlimited_tokens=true:</b>")
+        for user in db_users:
+            username = user.get("username") or "без username"
+            first_name = user.get("first_name") or ""
+            lines.append(
+                f"• <code>{user.get('telegram_id')}</code> — {first_name} @{username}"
+            )
+
+    if not env_ids and not db_users:
+        lines.append("Пока нет пользователей с безлимитным доступом.")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message(F.text == "💰 Баланс")
 async def balance_button_handler(message: Message):
     await show_balance(message)
@@ -1542,6 +1795,8 @@ async def help_button_handler(message: Message):
 💰 Баланс — пополнение токенов через Telegram Stars
 ⚙️ Автопостинг — ежедневная карта дня по расписанию.
 
+Для администратора: /myid, /grant_unlimited, /revoke_unlimited, /unlimited_list
+
 Версия: {APP_VERSION}"""
 
     await message.answer(text, reply_markup=MAIN_MENU)
@@ -1621,6 +1876,8 @@ async def root():
             "daily_autopost",
             "manual_daily_now",
             "version_marker",
+            "telegram_stars_balance",
+            "unlimited_tokens",
         ],
     }
 
