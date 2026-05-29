@@ -186,7 +186,7 @@ async def start_handler(message: Message):
         "Пока это развлекательный MVP, не воспринимай расклады как финансовый, медицинский или юридический совет."
     )
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 @dp.message(Command("birth"))
@@ -201,7 +201,7 @@ async def birth_handler(message: Message):
         await message.answer(
             "Напиши дату и время рождения в формате:\n\n"
             "`/birth 2000-05-17 14:30`",
-            parse_mode="Markdown"
+            
         )
         return
 
@@ -229,7 +229,7 @@ async def birth_cards_handler(message: Message):
         await message.answer(
             "Сначала сохрани дату рождения:\n\n"
             "`/birth 2000-05-17 14:30`",
-            parse_mode="Markdown"
+            
         )
         return
 
@@ -246,7 +246,7 @@ async def birth_cards_handler(message: Message):
         f"{format_cards(cards)}"
     )
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 @dp.message(Command("day"))
@@ -270,7 +270,7 @@ async def daily_card_handler(message: Message):
         "Эта карта закреплена за тобой до конца текущего дня."
     )
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 @dp.message(Command("three"))
@@ -294,7 +294,7 @@ async def three_cards_handler(message: Message):
         "Этот расклад закреплён за тобой до конца текущего дня."
     )
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 @dp.message(Command("situation"))
@@ -307,7 +307,7 @@ async def situation_handler(message: Message):
         await message.answer(
             "Напиши вопрос после команды, например:\n\n"
             "`/situation стоит ли мне менять работу?`",
-            parse_mode="Markdown"
+            
         )
         return
 
@@ -330,7 +330,7 @@ async def situation_handler(message: Message):
         "Совет: воспринимай расклад как способ посмотреть на ситуацию под другим углом, а не как окончательное решение."
     )
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 @app.get("/")
