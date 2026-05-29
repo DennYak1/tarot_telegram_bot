@@ -1,29 +1,36 @@
 import os
-import json
+import re
 import random
 import hashlib
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import asyncio
+from datetime import datetime, date
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
 from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton
 from supabase import create_client
 
-from fastapi.staticfiles import StaticFiles
+
+APP_VERSION = "2026-05-29-autopost-v3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = os.getenv("BASE_URL")  # например: https://your-bot.onrender.com
+BASE_URL = os.getenv("BASE_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tarot-secret")
+CRON_SECRET = os.getenv("CRON_SECRET", WEBHOOK_SECRET)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-TZ = ZoneInfo("Europe/Berlin")
+DEFAULT_TIMEZONE = "Europe/Berlin"
+DEFAULT_DAILY_POST_TIME = "08:00"
+TZ = ZoneInfo(DEFAULT_TIMEZONE)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -31,12 +38,14 @@ if not BOT_TOKEN:
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
 
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
 
 CARD_IMAGES = {
     # Старшие арканы
@@ -331,6 +340,7 @@ REVERSED_CARD_MEANINGS = {
     "Король Жезлов": "давление, авторитарность, чрезмерное стремление контролировать",
 }
 
+
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -343,31 +353,76 @@ MAIN_MENU = ReplyKeyboardMarkup(
         ],
         [
             KeyboardButton(text="📅 Сохранить дату рождения"),
+            KeyboardButton(text="⚙️ Автопостинг"),
+        ],
+        [
             KeyboardButton(text="ℹ️ Помощь"),
         ],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выберите действие"
+    input_field_placeholder="Выберите действие",
 )
 
-USER_WAITING_ACTION = {}
+AUTOPOST_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="✅ Включить автопостинг"),
+            KeyboardButton(text="🚫 Выключить автопостинг"),
+        ],
+        [
+            KeyboardButton(text="🕗 Изменить время"),
+            KeyboardButton(text="🌍 Изменить часовой пояс"),
+        ],
+        [
+            KeyboardButton(text="📨 Отправить карту сейчас"),
+            KeyboardButton(text="⬅️ Главное меню"),
+        ],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Настройки автопостинга",
+)
+
+USER_WAITING_ACTION: dict[int, str] = {}
 
 
-def today_str() -> str:
-    return datetime.now(TZ).date().isoformat()
+def safe_timezone(timezone_name: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone_name or DEFAULT_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo(DEFAULT_TIMEZONE)
 
 
-def get_card_image_url(card) -> str | None:
-    name = card_name(card)
-    filename = CARD_IMAGES.get(name)
+def today_str(timezone_name: str | None = None) -> str:
+    tz = safe_timezone(timezone_name)
+    return datetime.now(tz).date().isoformat()
 
-    if not filename:
-        print(f"[CARD_IMAGE] Не найден файл для карты: {name}")
+
+def current_time_hhmm(timezone_name: str | None = None) -> str:
+    tz = safe_timezone(timezone_name)
+    return datetime.now(tz).strftime("%H:%M")
+
+
+def normalize_time(value: str) -> str | None:
+    raw = value.strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if not match:
         return None
 
-    public_base_url = BASE_URL or "https://tarot-telegram-bot-0hfs.onrender.com"
+    hour = int(match.group(1))
+    minute = int(match.group(2))
 
-    return f"{public_base_url.rstrip('/')}/static/cards/{filename}"
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+
+    return f"{hour:02d}:{minute:02d}"
+
+
+def looks_like_birth_datetime(value: str) -> bool:
+    try:
+        datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+        return True
+    except ValueError:
+        return False
 
 
 def make_seed(*parts: str) -> int:
@@ -383,10 +438,10 @@ def draw_cards(seed: int, count: int, allow_reversed: bool = True) -> list[dict]
 
     result = []
 
-    for card_name in deck[:count]:
+    for card_name_value in deck[:count]:
         result.append({
-            "name": card_name,
-            "reversed": rng.choice([False, True]) if allow_reversed else False
+            "name": card_name_value,
+            "reversed": rng.choice([False, True]) if allow_reversed else False,
         })
 
     return result
@@ -419,24 +474,57 @@ def get_card_meaning(card) -> str:
     if card_is_reversed(card):
         return REVERSED_CARD_MEANINGS.get(
             name,
-            "энергия карты проявляется нестабильно, заблокировано или требует внутренней переоценки"
+            "энергия карты проявляется нестабильно, заблокировано или требует внутренней переоценки",
         )
 
-    return CARD_MEANINGS.get(
-        name,
-        "толкование пока не добавлено"
-    )
+    return CARD_MEANINGS.get(name, "толкование пока не добавлено")
 
 
 def format_cards(cards: list) -> str:
     lines = []
 
-    for i, card in enumerate(cards, start=1):
-        lines.append(
-            f"{i}. {card_title(card)} — {get_card_meaning(card)}"
-        )
+    for index, card in enumerate(cards, start=1):
+        lines.append(f"{index}. {card_title(card)} — {get_card_meaning(card)}")
 
     return "\n".join(lines)
+
+
+def get_card_image_url(card) -> str | None:
+    name = card_name(card)
+    filename = CARD_IMAGES.get(name)
+
+    if not filename:
+        print(f"[CARD_IMAGE] Не найден файл для карты: {name}")
+        return None
+
+    public_base_url = BASE_URL or "https://tarot-telegram-bot-0hfs.onrender.com"
+    return f"{public_base_url.rstrip('/')}/static/cards/{filename}"
+
+
+async def answer_card(message: Message, card, caption: str):
+    image_url = get_card_image_url(card)
+
+    if image_url:
+        try:
+            await message.answer_photo(photo=image_url, caption=caption)
+            return
+        except Exception as exc:
+            print(f"[TELEGRAM_PHOTO_ERROR] {exc}")
+
+    await message.answer(caption)
+
+
+async def send_card_to_chat(chat_id: int, card, caption: str):
+    image_url = get_card_image_url(card)
+
+    if image_url:
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=image_url, caption=caption)
+            return
+        except Exception as exc:
+            print(f"[TELEGRAM_PHOTO_ERROR] {exc}")
+
+    await bot.send_message(chat_id=chat_id, text=caption)
 
 
 def get_or_create_user(message: Message):
@@ -454,38 +542,38 @@ def get_or_create_user(message: Message):
     if existing.data:
         return existing.data[0]
 
-    created = (
-        supabase.table("users")
-        .insert({
+    payload = {
+        "telegram_id": telegram_id,
+        "username": username,
+        "first_name": first_name,
+    }
+
+    try:
+        payload.update({
+            "timezone": DEFAULT_TIMEZONE,
+            "daily_post_enabled": True,
+            "daily_post_time": DEFAULT_DAILY_POST_TIME,
+        })
+
+        created = supabase.table("users").insert(payload).execute()
+        return created.data[0]
+    except Exception as exc:
+        print(f"[USER_CREATE_EXTENDED_FIELDS_ERROR] {exc}")
+
+        fallback_payload = {
             "telegram_id": telegram_id,
             "username": username,
             "first_name": first_name,
-        })
-        .execute()
-    )
-
-    return created.data[0]
+        }
+        created = supabase.table("users").insert(fallback_payload).execute()
+        return created.data[0]
 
 
-def save_reading(user_id: int, reading_type: str, cards: list, question_text: str | None = None):
-    payload = {
-        "user_id": user_id,
-        "reading_type": reading_type,
-        "reading_date": today_str(),
-        "question_text": question_text,
-        "cards": cards,
-    }
-
-    return supabase.table("readings").insert(payload).execute()
-
-
-def get_daily_reading(user_id: int, reading_type: str):
+def get_user_by_telegram_id(telegram_id: int):
     result = (
-        supabase.table("readings")
+        supabase.table("users")
         .select("*")
-        .eq("user_id", user_id)
-        .eq("reading_type", reading_type)
-        .eq("reading_date", today_str())
+        .eq("telegram_id", telegram_id)
         .execute()
     )
 
@@ -495,125 +583,140 @@ def get_daily_reading(user_id: int, reading_type: str):
     return None
 
 
-@dp.message(Command("start"))
-async def start_handler(message: Message):
-    get_or_create_user(message)
-
-    text = """Привет. Я Tarot-бот 🔮
-
-Выбери действие на кнопках ниже:
-
-🌞 Карта дня — личная карта до конца дня
-🔮 3 карты — прошлое / настоящее / будущее
-🧬 Карты рождения — 5 карт по дате и времени рождения
-✍️ Расклад на ситуацию — задай свой вопрос
-
-Пока это развлекательный ботик. Не воспринимай расклады как финансовый, медицинский или юридический совет."""
-
-    await message.answer(text, reply_markup=MAIN_MENU)
+def get_user_by_internal_id(user_id: int):
+    result = supabase.table("users").select("*").eq("id", user_id).execute()
+    if result.data:
+        return result.data[0]
+    return None
 
 
-@dp.message(Command("birth"))
-async def birth_handler(message: Message):
-    user = get_or_create_user(message)
-
-    raw = message.text.replace("/birth", "").strip()
-
-    try:
-        birth_dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
-    except ValueError:
-        await message.answer(
-            "Напиши дату и время рождения в формате:\n\n"
-            "`/birth 2000-05-17 14:30`",
-
-        )
-        return
-
-    birth_dt = birth_dt.replace(tzinfo=TZ)
-
-    supabase.table("users").update({
-        "birth_datetime": birth_dt.isoformat()
-    }).eq("id", user["id"]).execute()
-
-    await message.answer("Дата и время рождения сохранены ✨")
+def update_user(user_id: int, payload: dict):
+    return supabase.table("users").update(payload).eq("id", user_id).execute()
 
 
-@dp.message(Command("birth_cards"))
-async def birth_cards_handler(message: Message):
-    user = get_or_create_user(message)
+def user_timezone(user: dict | None) -> str:
+    if not user:
+        return DEFAULT_TIMEZONE
+    return user.get("timezone") or DEFAULT_TIMEZONE
 
-    full_user = (
-        supabase.table("users")
+
+def user_daily_time(user: dict | None) -> str:
+    if not user:
+        return DEFAULT_DAILY_POST_TIME
+    return user.get("daily_post_time") or DEFAULT_DAILY_POST_TIME
+
+
+def user_daily_enabled(user: dict | None) -> bool:
+    if not user:
+        return True
+    value = user.get("daily_post_enabled")
+    if value is None:
+        return True
+    return bool(value)
+
+
+def save_reading(
+    user_id: int,
+    reading_type: str,
+    cards: list,
+    question_text: str | None = None,
+    reading_date: str | None = None,
+):
+    payload = {
+        "user_id": user_id,
+        "reading_type": reading_type,
+        "reading_date": reading_date or today_str(),
+        "question_text": question_text,
+        "cards": cards,
+    }
+
+    return supabase.table("readings").insert(payload).execute()
+
+
+def get_daily_reading(user_id: int, reading_type: str, reading_date: str | None = None):
+    result = (
+        supabase.table("readings")
         .select("*")
-        .eq("id", user["id"])
+        .eq("user_id", user_id)
+        .eq("reading_type", reading_type)
+        .eq("reading_date", reading_date or today_str())
         .execute()
-    ).data[0]
+    )
 
-    if not full_user.get("birth_datetime"):
+    if result.data:
+        return result.data[0]
+
+    return None
+
+
+def get_or_create_daily_card_for_user(user: dict):
+    tz_name = user_timezone(user)
+    local_date = today_str(tz_name)
+    existing = get_daily_reading(user["id"], "daily_card", local_date)
+
+    if existing:
+        cards = existing["cards"]
+    else:
+        seed = make_seed("daily_card", user["telegram_id"], local_date)
+        cards = draw_cards(seed, 1, allow_reversed=True)
+        save_reading(user["id"], "daily_card", cards, reading_date=local_date)
+
+    return cards[0], local_date
+
+
+async def send_daily_card_for_user(user: dict, chat_id: int | None = None, prefix: str = "Карта дня на сегодня"):
+    card, local_date = get_or_create_daily_card_for_user(user)
+
+    text = f"""{prefix}: {card_title(card)}
+
+Смысл карты: {get_card_meaning(card)}.
+
+Дата: {local_date}
+Эта карта закреплена за тобой до конца текущего дня."""
+
+    await send_card_to_chat(chat_id or int(user["telegram_id"]), card, text)
+
+
+async def send_birth_cards_for_message(message: Message, user: dict):
+    full_user = get_user_by_internal_id(user["id"])
+
+    if not full_user or not full_user.get("birth_datetime"):
         await message.answer(
-            "Сначала сохрани дату рождения:\n\n"
-            "`/birth 2000-05-17 14:30`",
-
+            "Сначала сохрани дату рождения. Нажми «📅 Сохранить дату рождения» "
+            "или напиши, например: 2000-05-17 14:30",
+            reply_markup=MAIN_MENU,
         )
         return
 
     seed = make_seed("birth", full_user["birth_datetime"])
     cards = draw_cards(seed, 5, allow_reversed=False)
 
-    text = (
-        "Твой личный набор карт по дате и времени рождения:\n\n"
-        "1 — архетип личности\n"
-        "2 — внутренний ресурс\n"
-        "3 — главный урок\n"
-        "4 — скрытая энергия\n"
-        "5 — направление пути\n\n"
-        f"{format_cards(cards)}"
-    )
+    positions = [
+        "Архетип личности",
+        "Внутренний ресурс",
+        "Главный урок",
+        "Скрытая энергия",
+        "Направление пути",
+    ]
 
-    await message.answer(text)
+    await message.answer("Твой личный набор карт по дате и времени рождения:")
 
-
-@dp.message(Command("day"))
-async def daily_card_handler(message: Message):
-    user = get_or_create_user(message)
-
-    existing = get_daily_reading(user["id"], "daily_card")
-
-    if existing:
-        cards = existing["cards"]
-    else:
-        seed = make_seed("daily_card", user["telegram_id"], today_str())
-        cards = draw_cards(seed, 1, allow_reversed=True)
-        save_reading(user["id"], "daily_card", cards)
-
-    card = cards[0]
-
-    text = f"""Карта дня на сегодня: {card_title(card)}
-
-Смысл карты: {get_card_meaning(card)}.
-
-Эта карта закреплена за тобой до конца текущего дня."""
-
-    image_url = get_card_image_url(card)
-
-    if image_url:
-        await message.answer_photo(photo=image_url, caption=text)
-    else:
-        await message.answer(text)
+    for position, card in zip(positions, cards):
+        caption = f"""{position}: {card_title(card)}
+{get_card_meaning(card)}"""
+        await answer_card(message, card, caption)
 
 
-@dp.message(Command("three"))
-async def three_cards_handler(message: Message):
-    user = get_or_create_user(message)
-
-    existing = get_daily_reading(user["id"], "three_cards")
+async def send_three_cards_for_message(message: Message, user: dict):
+    local_date = today_str(user_timezone(user))
+    existing = get_daily_reading(user["id"], "three_cards", local_date)
 
     if existing:
         cards = existing["cards"]
     else:
-        seed = make_seed("three_cards", user["telegram_id"], today_str())
+        seed = make_seed("three_cards", user["telegram_id"], local_date)
         cards = draw_cards(seed, 3, allow_reversed=True)
-        save_reading(user["id"], "three_cards", cards)
+        save_reading(user["id"], "three_cards", cards, reading_date=local_date)
 
     positions = [
         ("Прошлое", cards[0]),
@@ -626,30 +729,19 @@ async def three_cards_handler(message: Message):
     for position, card in positions:
         caption = f"""{position}: {card_title(card)}
 {get_card_meaning(card)}"""
-
-        image_url = get_card_image_url(card)
-
-        if image_url:
-            await message.answer_photo(photo=image_url, caption=caption)
-        else:
-            await message.answer(caption)
+        await answer_card(message, card, caption)
 
     await message.answer("Этот расклад закреплён за тобой до конца текущего дня.")
 
 
-@dp.message(Command("situation"))
-async def situation_handler(message: Message):
-    user = get_or_create_user(message)
-
-    question = message.text.replace("/situation", "").strip()
+async def send_situation_reading_for_message(message: Message, user: dict, question: str):
+    question = question.strip()
 
     if not question:
-        await message.answer("""Напиши вопрос после команды, например:
-
-/situation стоит ли мне менять работу?""")
+        await message.answer("Напиши вопрос или коротко опиши ситуацию.")
         return
 
-    seed = make_seed("situation", user["telegram_id"], today_str(), question)
+    seed = make_seed("situation", user["telegram_id"], today_str(user_timezone(user)), question)
     cards = draw_cards(seed, 3, allow_reversed=True)
 
     save_reading(
@@ -657,6 +749,7 @@ async def situation_handler(message: Message):
         reading_type="situation",
         cards=cards,
         question_text=question,
+        reading_date=today_str(user_timezone(user)),
     )
 
     positions = [
@@ -672,18 +765,200 @@ async def situation_handler(message: Message):
     for position, card in positions:
         caption = f"""{position}: {card_title(card)}
 {get_card_meaning(card)}"""
-
-        image_url = get_card_image_url(card)
-
-        if image_url:
-            await message.answer_photo(photo=image_url, caption=caption)
-        else:
-            await message.answer(caption)
+        await answer_card(message, card, caption)
 
     await message.answer(
         "Совет: воспринимай расклад как способ посмотреть на ситуацию под другим углом, а не как окончательное решение.",
         reply_markup=MAIN_MENU,
     )
+
+
+async def save_birth_datetime_for_message(message: Message, user: dict, raw: str):
+    raw = raw.strip()
+
+    try:
+        birth_dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await message.answer(
+            "Не получилось распознать дату. Напиши в формате:\n\n2000-05-17 14:30",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    birth_dt = birth_dt.replace(tzinfo=safe_timezone(user_timezone(user)))
+
+    update_user(user["id"], {"birth_datetime": birth_dt.isoformat()})
+    await message.answer("Дата и время рождения сохранены ✨", reply_markup=MAIN_MENU)
+
+
+def autopost_settings_text(user: dict) -> str:
+    status = "включён ✅" if user_daily_enabled(user) else "выключен 🚫"
+    return f"""⚙️ Автопостинг карты дня
+
+Статус: {status}
+Время: {user_daily_time(user)}
+Часовой пояс: {user_timezone(user)}
+
+По умолчанию автопостинг включён и стоит на 08:00 по локальному времени пользователя."""
+
+
+async def show_autopost_settings(message: Message):
+    user = get_or_create_user(message)
+    await message.answer(autopost_settings_text(user), reply_markup=AUTOPOST_MENU)
+
+
+async def process_daily_autoposts():
+    processed = 0
+    sent = 0
+    skipped = 0
+    errors = []
+
+    try:
+        users_result = (
+            supabase.table("users")
+            .select("*")
+            .execute()
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Не удалось прочитать users. Возможно, не добавлены колонки автопостинга: {exc}",
+        }
+
+    for user in users_result.data or []:
+        processed += 1
+
+        try:
+            if not user_daily_enabled(user):
+                skipped += 1
+                continue
+
+            tz_name = user_timezone(user)
+            local_today = today_str(tz_name)
+            target_time = normalize_time(user_daily_time(user)) or DEFAULT_DAILY_POST_TIME
+            now_hhmm = current_time_hhmm(tz_name)
+            last_sent = user.get("last_daily_card_sent_date")
+
+            if isinstance(last_sent, date):
+                last_sent = last_sent.isoformat()
+
+            if last_sent == local_today:
+                skipped += 1
+                continue
+
+            if now_hhmm < target_time:
+                skipped += 1
+                continue
+
+            await send_daily_card_for_user(
+                user,
+                chat_id=int(user["telegram_id"]),
+                prefix="Твоя карта дня по расписанию",
+            )
+
+            try:
+                update_user(user["id"], {"last_daily_card_sent_date": local_today})
+            except Exception as update_exc:
+                errors.append(f"user {user.get('id')} sent, but update failed: {update_exc}")
+
+            sent += 1
+        except Exception as exc:
+            errors.append(f"user {user.get('id')}: {exc}")
+
+    return {
+        "ok": True,
+        "processed": processed,
+        "sent": sent,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+async def autopost_background_loop():
+    while True:
+        try:
+            await process_daily_autoposts()
+        except Exception as exc:
+            print(f"[AUTOPOST_LOOP_ERROR] {exc}")
+        await asyncio.sleep(300)
+
+
+@dp.message(Command("start"))
+async def start_handler(message: Message):
+    get_or_create_user(message)
+
+    text = f"""Привет. Я Tarot-бот 🔮
+
+Выбери действие на кнопках ниже:
+
+🌞 Карта дня — личная карта до конца дня
+🔮 3 карты — прошлое / настоящее / будущее
+🧬 Карты рождения — 5 карт по дате и времени рождения
+✍️ Расклад на ситуацию — задай свой вопрос
+⚙️ Автопостинг — ежедневная карта дня по расписанию
+
+Версия: {APP_VERSION}
+
+Пока это развлекательный ботик. Не воспринимай расклады как финансовый, медицинский или юридический совет."""
+
+    await message.answer(text, reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("version"))
+async def version_handler(message: Message):
+    await message.answer(f"Версия бота: {APP_VERSION}", reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("birth"))
+async def birth_handler(message: Message):
+    user = get_or_create_user(message)
+    raw = message.text.replace("/birth", "").strip()
+    await save_birth_datetime_for_message(message, user, raw)
+
+
+@dp.message(Command("birth_cards"))
+async def birth_cards_handler(message: Message):
+    user = get_or_create_user(message)
+    await send_birth_cards_for_message(message, user)
+
+
+@dp.message(Command("day"))
+async def daily_card_handler(message: Message):
+    user = get_or_create_user(message)
+    await send_daily_card_for_user(user, chat_id=message.chat.id)
+
+
+@dp.message(Command("daily_now"))
+async def daily_now_handler(message: Message):
+    user = get_or_create_user(message)
+    await send_daily_card_for_user(user, chat_id=message.chat.id, prefix="Карта дня по запросу")
+
+
+@dp.message(Command("three"))
+async def three_cards_handler(message: Message):
+    user = get_or_create_user(message)
+    await send_three_cards_for_message(message, user)
+
+
+@dp.message(Command("situation"))
+async def situation_handler(message: Message):
+    user = get_or_create_user(message)
+    question = message.text.replace("/situation", "").strip()
+
+    if not question:
+        USER_WAITING_ACTION[message.from_user.id] = "situation"
+        await message.answer(
+            "Опиши ситуацию или задай вопрос. Например:\n\nСтоит ли мне менять работу?",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    await send_situation_reading_for_message(message, user, question)
+
+
+@dp.message(Command("autopost"))
+async def autopost_command_handler(message: Message):
+    await show_autopost_settings(message)
 
 
 @dp.message(F.text == "🌞 Карта дня")
@@ -704,107 +979,200 @@ async def birth_cards_button_handler(message: Message):
 @dp.message(F.text == "📅 Сохранить дату рождения")
 async def ask_birth_datetime_handler(message: Message):
     USER_WAITING_ACTION[message.from_user.id] = "birth_datetime"
-
     await message.answer(
-        "Напиши дату и время рождения в формате:\n\n"
-        "2000-05-17 14:30"
+        "Напиши дату и время рождения в формате:\n\n2000-05-17 14:30",
+        reply_markup=MAIN_MENU,
     )
 
 
 @dp.message(F.text == "✍️ Расклад на ситуацию")
 async def ask_situation_handler(message: Message):
     USER_WAITING_ACTION[message.from_user.id] = "situation"
-
     await message.answer(
-        "Опиши ситуацию или задай вопрос.\n\n"
-        "Например:\n"
-        "Стоит ли мне менять работу?"
+        "Опиши ситуацию или задай вопрос.\n\nНапример:\nСтоит ли мне менять работу?",
+        reply_markup=MAIN_MENU,
     )
+
+
+@dp.message(F.text == "⚙️ Автопостинг")
+async def autopost_button_handler(message: Message):
+    await show_autopost_settings(message)
+
+
+@dp.message(F.text == "✅ Включить автопостинг")
+async def enable_autopost_handler(message: Message):
+    user = get_or_create_user(message)
+    try:
+        update_user(user["id"], {"daily_post_enabled": True})
+        user["daily_post_enabled"] = True
+        await message.answer("Автопостинг включён ✅", reply_markup=AUTOPOST_MENU)
+    except Exception as exc:
+        await message.answer(
+            f"Не удалось включить автопостинг. Проверь, что SQL-колонки добавлены в Supabase.\n\n{exc}",
+            reply_markup=AUTOPOST_MENU,
+        )
+
+
+@dp.message(F.text == "🚫 Выключить автопостинг")
+async def disable_autopost_handler(message: Message):
+    user = get_or_create_user(message)
+    try:
+        update_user(user["id"], {"daily_post_enabled": False})
+        user["daily_post_enabled"] = False
+        await message.answer("Автопостинг выключен 🚫", reply_markup=AUTOPOST_MENU)
+    except Exception as exc:
+        await message.answer(
+            f"Не удалось выключить автопостинг. Проверь, что SQL-колонки добавлены в Supabase.\n\n{exc}",
+            reply_markup=AUTOPOST_MENU,
+        )
+
+
+@dp.message(F.text == "🕗 Изменить время")
+async def change_autopost_time_handler(message: Message):
+    USER_WAITING_ACTION[message.from_user.id] = "autopost_time"
+    await message.answer("Напиши новое время в формате HH:MM, например: 08:00", reply_markup=AUTOPOST_MENU)
+
+
+@dp.message(F.text == "🌍 Изменить часовой пояс")
+async def change_timezone_handler(message: Message):
+    USER_WAITING_ACTION[message.from_user.id] = "timezone"
+    await message.answer(
+        "Напиши часовой пояс в формате IANA.\n\nНапример:\nEurope/Berlin\nAsia/Tashkent\nEurope/Moscow",
+        reply_markup=AUTOPOST_MENU,
+    )
+
+
+@dp.message(F.text == "📨 Отправить карту сейчас")
+async def send_daily_now_button_handler(message: Message):
+    await daily_now_handler(message)
+
+
+@dp.message(F.text == "⬅️ Главное меню")
+async def back_to_main_menu_handler(message: Message):
+    USER_WAITING_ACTION.pop(message.from_user.id, None)
+    await message.answer("Главное меню", reply_markup=MAIN_MENU)
 
 
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_button_handler(message: Message):
-    text = (
-        "Что умеет бот:\n\n"
-        "🌞 Карта дня — одна карта, закреплена за тобой до конца дня.\n\n"
-        "🔮 3 карты — расклад прошлое / настоящее / будущее. "
-        "Тоже закрепляется до конца текущего дня.\n\n"
-        "🧬 Карты рождения — персональный набор из 5 карт по дате и времени рождения.\n\n"
-        "✍️ Расклад на ситуацию — ты пишешь вопрос, бот выбирает карты и даёт трактовку.\n\n"
-        "📅 Сохранить дату рождения — нужно для персональных карт рождения."
-    )
+    text = f"""Что умеет бот:
+
+🌞 Карта дня — одна карта, закреплена за тобой до конца дня.
+
+🔮 3 карты — расклад прошлое / настоящее / будущее. Тоже закрепляется до конца текущего дня.
+
+🧬 Карты рождения — персональный набор из 5 карт по дате и времени рождения.
+
+✍️ Расклад на ситуацию — ты пишешь вопрос, бот выбирает карты и даёт трактовку.
+
+📅 Сохранить дату рождения — нужно для персональных карт рождения.
+
+⚙️ Автопостинг — ежедневная карта дня по расписанию.
+
+Версия: {APP_VERSION}"""
 
     await message.answer(text, reply_markup=MAIN_MENU)
 
 
 @dp.message()
 async def plain_text_handler(message: Message):
+    user = get_or_create_user(message)
     user_id = message.from_user.id
     action = USER_WAITING_ACTION.get(user_id)
+    raw = (message.text or "").strip()
 
-    if action == "birth_datetime":
-        raw = message.text.strip()
+    if not raw:
+        await message.answer("Выбери действие на кнопках ниже.", reply_markup=MAIN_MENU)
+        return
+
+    if action == "birth_datetime" or looks_like_birth_datetime(raw):
+        USER_WAITING_ACTION.pop(user_id, None)
+        await save_birth_datetime_for_message(message, user, raw)
+        return
+
+    normalized_time = normalize_time(raw)
+
+    if action == "autopost_time" or normalized_time:
+        if not normalized_time:
+            await message.answer("Не получилось распознать время. Напиши в формате HH:MM, например: 08:00")
+            return
+
+        USER_WAITING_ACTION.pop(user_id, None)
 
         try:
-            datetime.strptime(raw, "%Y-%m-%d %H:%M")
-        except ValueError:
+            update_user(user["id"], {"daily_post_time": normalized_time})
+            await message.answer(f"Время автопостинга сохранено: {normalized_time}", reply_markup=AUTOPOST_MENU)
+        except Exception as exc:
             await message.answer(
-                "Не получилось распознать дату.\n\n"
-                "Напиши в формате:\n"
-                "2000-05-17 14:30"
+                f"Не удалось сохранить время. Проверь SQL-колонки в Supabase.\n\n{exc}",
+                reply_markup=AUTOPOST_MENU,
             )
+        return
+
+    if action == "timezone" or "/" in raw:
+        try:
+            safe_timezone(raw)
+        except Exception:
+            await message.answer("Не получилось распознать часовой пояс. Пример: Europe/Berlin")
             return
 
         USER_WAITING_ACTION.pop(user_id, None)
 
-        message.text = f"/birth {raw}"
-        await birth_handler(message)
-
-        await message.answer(
-            "Теперь можно открыть карты рождения.",
-            reply_markup=MAIN_MENU
-        )
+        try:
+            update_user(user["id"], {"timezone": raw})
+            await message.answer(f"Часовой пояс сохранён: {raw}", reply_markup=AUTOPOST_MENU)
+        except Exception as exc:
+            await message.answer(
+                f"Не удалось сохранить часовой пояс. Проверь SQL-колонки в Supabase.\n\n{exc}",
+                reply_markup=AUTOPOST_MENU,
+            )
         return
 
-    if action == "situation":
-        question = message.text.strip()
-
-        if not question:
-            await message.answer("Напиши вопрос или коротко опиши ситуацию.")
-            return
-
+    if action == "situation" or len(raw) >= 8:
         USER_WAITING_ACTION.pop(user_id, None)
-
-        message.text = f"/situation {question}"
-        await situation_handler(message)
-
-        await message.answer(
-            "Можешь выбрать следующий расклад.",
-            reply_markup=MAIN_MENU
-        )
+        await send_situation_reading_for_message(message, user, raw)
         return
 
-    await message.answer(
-        "Выбери действие на кнопках ниже.",
-        reply_markup=MAIN_MENU
-    )
+    await message.answer("Выбери действие на кнопках ниже.", reply_markup=MAIN_MENU)
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "tarot-bot"}
+    return {
+        "status": "ok",
+        "service": "tarot-bot",
+        "version": APP_VERSION,
+        "features": [
+            "birth_cards_images",
+            "situation_button",
+            "daily_autopost",
+            "manual_daily_now",
+            "version_marker",
+        ],
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "version": APP_VERSION}
+
+
+@app.get("/cron/daily-cards/{secret}")
+async def cron_daily_cards(secret: str):
+    if secret != CRON_SECRET:
+        return {"ok": False, "error": "bad secret"}
+
+    return await process_daily_autoposts()
 
 
 @app.on_event("startup")
 async def on_startup():
     if BASE_URL:
-        webhook_url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
+        webhook_url = f"{BASE_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
         await bot.set_webhook(webhook_url)
+
+    if os.getenv("ENABLE_BACKGROUND_AUTOPOST", "1") == "1":
+        asyncio.create_task(autopost_background_loop())
 
 
 @app.post("/webhook/{secret}")
